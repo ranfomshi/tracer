@@ -1,61 +1,51 @@
 // Core ball-tracking logic. Runs entirely in the browser on canvas pixel data.
 //
-// Strategy: the ball is a small object that MOVES relative to the (mostly
-// static) background — it may be lighter OR darker than what's behind it, so we
-// don't assume brightness. Instead we sample the ball's actual colour from the
-// user's seed click and, for each subsequent frame:
-//   1. compute a per-pixel "motion" signal by differencing consecutive frames,
-//   2. among the moving pixels, score how well each matches the ball's colour
-//      template (this also rejects the frame-difference "ghost" left where the
-//      ball used to be, which now shows background),
-//   3. search a window around the predicted position and take the weighted
-//      centroid of the best-matching cluster,
-//   4. update velocity for the next prediction. An optional landing point pulls
-//      the prediction toward where the ball is known to come down.
+// Approach: detect-then-fit with a physics prior.
 //
-// This is deliberately classical CV — no model downloads, no GPU required — so
-// it works offline and within a static Netlify deploy.
+//   1. Sample the ball's colour from the user's impact (seed) click — works for
+//      a ball that is lighter OR darker than the background.
+//   2. For every frame, scan the region of interest for pixels that MOVED since
+//      the previous frame AND match the ball's colour, then group them into
+//      blobs. Each frame yields a list of candidate positions (not one guess),
+//      so a fast ball is never "lost" by a too-small search window.
+//   3. Fit a motion model through those candidates, anchored at the impact point
+//      (and the landing point, if given):
+//          x(t) = vx·t + x0          (≈ constant horizontal speed)
+//          y(t) = a·t² + vy·t + y0   (constant downward accel — gravity)
+//      In a fixed-camera image a ball under gravity is very close to this
+//      parabola-in-time: it decelerates on the way up, hangs at the apex, then
+//      accelerates down. Fitting it iteratively (assign nearest candidate →
+//      refit) rejects off-trajectory false positives and fills gaps.
+//
+// Classical CV + a physics model — no downloads, no GPU, fully offline.
 
 export interface TrackPoint {
-  /** Frame index this point belongs to. */
   frame: number;
-  /** Video time in seconds. */
   t: number;
-  /** Ball position in video pixel coordinates. */
   x: number;
   y: number;
-  /** Detection confidence 0..1. `manual` points are always 1. */
+  /** Detection support 0..1 (how well a real detection backed this point). */
   confidence: number;
-  /** True when the user placed/corrected this point by hand. */
+  /** True for the user-placed impact/landing anchors. */
   manual: boolean;
 }
 
 export interface TrackOptions {
-  /** Half-width of the search window in pixels (scales with speed too). */
-  searchRadius: number;
   /** Frame-difference delta below which a pixel is treated as static (0..255). */
   motionThreshold: number;
   /** Max colour distance (0..441) a pixel may be from the ball template. */
   colorTolerance: number;
-  /** Stop tracking after this many consecutive misses (ignored if a landing
-   *  point is supplied — then we coast all the way to it). */
-  maxMisses: number;
-  /** Velocity smoothing factor 0..1 (higher = smoother, laggier). */
-  velocitySmoothing: number;
-  /** How strongly the landing point pulls the prediction, 0..1. */
-  landingPull: number;
+  /** Largest blob (in px) still considered a ball candidate, as a fraction of
+   *  the search-region area. Bigger blobs (camera shake, people) are dropped. */
+  maxBlobFraction: number;
 }
 
 export const DEFAULT_OPTIONS: TrackOptions = {
-  searchRadius: 60,
-  motionThreshold: 22,
-  colorTolerance: 115,
-  maxMisses: 6,
-  velocitySmoothing: 0.45,
-  landingPull: 0.5,
+  motionThreshold: 18,
+  colorTolerance: 120,
+  maxBlobFraction: 0.04,
 };
 
-/** A rectangular region in video pixel coordinates. */
 export interface Rect {
   x: number;
   y: number;
@@ -63,7 +53,6 @@ export interface Rect {
   h: number;
 }
 
-/** A single grabbed frame: raw RGBA pixels plus dimensions. */
 export interface Frame {
   frame: number;
   t: number;
@@ -72,16 +61,24 @@ export interface Frame {
   height: number;
 }
 
+/** A detected blob: position plus a score (summed motion×colour weight). */
+export interface Candidate {
+  x: number;
+  y: number;
+  score: number;
+}
+
+/** Result of a trace: the fitted path plus the raw per-frame candidates (for
+ *  the debug overlay). `candidates[n]` lines up with frame index n. */
+export interface TraceResult {
+  points: TrackPoint[];
+  candidates: Candidate[][];
+}
+
 interface RGB {
   r: number;
   g: number;
   b: number;
-}
-
-interface Detection {
-  x: number;
-  y: number;
-  confidence: number;
 }
 
 function luma(r: number, g: number, b: number): number {
@@ -111,44 +108,30 @@ function sampleColor(f: Frame, cx: number, cy: number, r: number): RGB {
 }
 
 /**
- * Find the ball within a search window. A pixel counts only if it MOVED since
- * the previous frame and its colour resembles the ball template; we then take
- * the weighted centroid. Returns null if nothing qualifies.
+ * Find candidate ball blobs in one frame: pixels that moved since `prev` and
+ * resemble the ball colour, grouped into connected components. Returns the
+ * strongest few, ranked by score.
  */
-function detectInWindow(
+function findCandidates(
   cur: Frame,
   prev: Frame,
   template: RGB,
-  cx: number,
-  cy: number,
-  radius: number,
   opts: TrackOptions,
   roi?: Rect | null,
-): Detection | null {
+): Candidate[] {
   const { width, height } = cur;
-  let x0 = Math.max(0, Math.floor(cx - radius));
-  let x1 = Math.min(width - 1, Math.ceil(cx + radius));
-  let y0 = Math.max(0, Math.floor(cy - radius));
-  let y1 = Math.min(height - 1, Math.ceil(cy + radius));
+  const rx0 = roi ? Math.max(0, Math.floor(roi.x)) : 0;
+  const ry0 = roi ? Math.max(0, Math.floor(roi.y)) : 0;
+  const rx1 = roi ? Math.min(width - 1, Math.ceil(roi.x + roi.w) - 1) : width - 1;
+  const ry1 = roi ? Math.min(height - 1, Math.ceil(roi.y + roi.h) - 1) : height - 1;
+  const rw = rx1 - rx0 + 1;
+  const rh = ry1 - ry0 + 1;
+  if (rw <= 0 || rh <= 0) return [];
 
-  // Clip the search window to the region of interest so anything outside the
-  // user-drawn box can never be picked up.
-  if (roi) {
-    x0 = Math.max(x0, Math.floor(roi.x));
-    y0 = Math.max(y0, Math.floor(roi.y));
-    x1 = Math.min(x1, Math.ceil(roi.x + roi.w) - 1);
-    y1 = Math.min(y1, Math.ceil(roi.y + roi.h) - 1);
-    if (x0 > x1 || y0 > y1) return null;
-  }
-
-  let sumW = 0;
-  let sumX = 0;
-  let sumY = 0;
-  let peak = 0;
-  let count = 0;
-
-  for (let y = y0; y <= y1; y++) {
-    for (let x = x0; x <= x1; x++) {
+  // Per-pixel weight for the region (0 = not a ball pixel).
+  const weight = new Float32Array(rw * rh);
+  for (let y = ry0; y <= ry1; y++) {
+    for (let x = rx0; x <= rx1; x++) {
       const i = (y * width + x) * 4;
       const r = cur.data[i];
       const g = cur.data[i + 1];
@@ -157,46 +140,107 @@ function detectInWindow(
         luma(r, g, b) - luma(prev.data[i], prev.data[i + 1], prev.data[i + 2]),
       );
       if (motion < opts.motionThreshold) continue;
-
-      // Colour similarity to the ball — works for light OR dark balls and
-      // rejects the ghost (sky) the ball moved away from.
       const dr = r - template.r;
       const dg = g - template.g;
       const db = b - template.b;
-      const colorDist = Math.sqrt(dr * dr + dg * dg + db * db);
-      const sim = 1 - Math.min(1, colorDist / opts.colorTolerance);
+      const sim = 1 - Math.min(1, Math.sqrt(dr * dr + dg * dg + db * db) / opts.colorTolerance);
       if (sim <= 0) continue;
-
-      // Distance falloff keeps us locked onto the predicted location.
-      const ddx = (x - cx) / radius;
-      const ddy = (y - cy) / radius;
-      const dist = Math.min(1, Math.sqrt(ddx * ddx + ddy * ddy));
-
-      const w = Math.min(1, motion / 64) * sim * (1 - 0.6 * dist);
-      if (w <= 0) continue;
-      sumW += w;
-      sumX += x * w;
-      sumY += y * w;
-      peak = Math.max(peak, w);
-      count++;
+      weight[(y - ry0) * rw + (x - rx0)] = Math.min(1, motion / 64) * sim;
     }
   }
 
-  if (sumW === 0 || count < 2) return null;
+  // Connected-component labelling (8-connectivity) via an explicit stack.
+  const visited = new Uint8Array(rw * rh);
+  const stack: number[] = [];
+  const cands: Candidate[] = [];
+  const maxSize = Math.max(400, Math.floor(rw * rh * opts.maxBlobFraction));
 
-  const area = (x1 - x0 + 1) * (y1 - y0 + 1);
-  const compactness = 1 - Math.min(1, count / area);
-  const strength = Math.min(1, peak / 0.6);
-  const confidence = Math.max(0, Math.min(1, 0.5 * strength + 0.5 * compactness));
+  for (let p = 0; p < rw * rh; p++) {
+    if (visited[p] || weight[p] <= 0) continue;
+    stack.length = 0;
+    stack.push(p);
+    visited[p] = 1;
+    let sw = 0;
+    let sx = 0;
+    let sy = 0;
+    let size = 0;
+    while (stack.length) {
+      const q = stack.pop()!;
+      const qx = q % rw;
+      const qy = (q / rw) | 0;
+      const w = weight[q];
+      sw += w;
+      sx += (qx + rx0) * w;
+      sy += (qy + ry0) * w;
+      size++;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          if (dx === 0 && dy === 0) continue;
+          const nx = qx + dx;
+          const ny = qy + dy;
+          if (nx < 0 || ny < 0 || nx >= rw || ny >= rh) continue;
+          const nq = ny * rw + nx;
+          if (!visited[nq] && weight[nq] > 0) {
+            visited[nq] = 1;
+            stack.push(nq);
+          }
+        }
+      }
+    }
+    if (size > maxSize || sw <= 0) continue; // ignore huge motion regions
+    cands.push({ x: sx / sw, y: sy / sw, score: sw });
+  }
 
-  return { x: sumX / sumW, y: sumY / sumW, confidence };
+  cands.sort((a, b) => b.score - a.score);
+  return cands.slice(0, 6);
+}
+
+/** Weighted least-squares slope m for v = m·t + c0 (c0 fixed = anchor). */
+function fitLinear(s: { t: number; v: number; w: number }[], c0: number): number {
+  let num = 0;
+  let den = 0;
+  for (const p of s) {
+    num += p.w * p.t * (p.v - c0);
+    den += p.w * p.t * p.t;
+  }
+  return den > 1e-9 ? num / den : 0;
+}
+
+/** Weighted least-squares a,b for v = a·t² + b·t + c0 (c0 fixed = anchor). */
+function fitQuad(
+  s: { t: number; v: number; w: number }[],
+  c0: number,
+): { a: number; b: number } {
+  let St4 = 0;
+  let St3 = 0;
+  let St2 = 0;
+  let Sr2 = 0;
+  let Sr1 = 0;
+  for (const p of s) {
+    const t = p.t;
+    const w = p.w;
+    const r = p.v - c0;
+    const t2 = t * t;
+    St4 += w * t2 * t2;
+    St3 += w * t2 * t;
+    St2 += w * t2;
+    Sr2 += w * t2 * r;
+    Sr1 += w * t * r;
+  }
+  const det = St4 * St2 - St3 * St3;
+  if (Math.abs(det) < 1e-9) {
+    // Not enough curvature info — fall back to a straight line.
+    return { a: 0, b: St2 > 1e-9 ? Sr1 / St2 : 0 };
+  }
+  return {
+    a: (Sr2 * St2 - Sr1 * St3) / det,
+    b: (St4 * Sr1 - St3 * Sr2) / det,
+  };
 }
 
 /**
- * Track the ball across a sequence of already-grabbed consecutive frames,
- * starting from the seed position on `frames[0]`. If `end` (a landing point) is
- * given, the prediction is pulled toward it and the final point is anchored to
- * it exactly.
+ * Trace the ball across consecutive frames (frames[0] is the impact/seed
+ * frame). Returns the fitted physics path plus per-frame candidates.
  */
 export function trackBall(
   frames: Frame[],
@@ -204,103 +248,85 @@ export function trackBall(
   opts: TrackOptions = DEFAULT_OPTIONS,
   roi?: Rect | null,
   end?: { x: number; y: number } | null,
-): TrackPoint[] {
-  if (frames.length === 0) return [];
+): TraceResult {
+  if (frames.length === 0) return { points: [], candidates: [] };
 
   const template = sampleColor(frames[0], seed.x, seed.y, 3);
-
-  const points: TrackPoint[] = [
-    {
-      frame: frames[0].frame,
-      t: frames[0].t,
-      x: seed.x,
-      y: seed.y,
-      confidence: 1,
-      manual: true,
-    },
-  ];
-
-  let px = seed.x;
-  let py = seed.y;
-  let vx = 0;
-  let vy = 0;
-  let misses = 0;
   const N = frames.length;
+  const tEnd = N - 1;
 
+  const candidates: Candidate[][] = [[]];
   for (let n = 1; n < N; n++) {
-    const prev = frames[n - 1];
-    const cur = frames[n];
-
-    let predX = px + vx;
-    let predY = py + vy;
-    if (end) {
-      // Expected per-frame step if the remaining distance to the landing point
-      // were spread evenly over the remaining frames.
-      const remaining = Math.max(1, N - n);
-      const towardX = (end.x - px) / remaining;
-      const towardY = (end.y - py) / remaining;
-      const k = opts.landingPull;
-      predX = px + (1 - k) * vx + k * towardX;
-      predY = py + (1 - k) * vy + k * towardY;
-    }
-
-    const speed = Math.hypot(vx, vy);
-    const radius = Math.min(
-      Math.max(cur.width, cur.height) / 2,
-      opts.searchRadius + speed * 1.5,
-    );
-
-    const det = detectInWindow(
-      cur,
-      prev,
-      template,
-      predX,
-      predY,
-      radius,
-      opts,
-      roi,
-    );
-
-    let nx: number;
-    let ny: number;
-    let confidence: number;
-
-    if (det && det.confidence > 0.08) {
-      nx = det.x;
-      ny = det.y;
-      confidence = det.confidence;
-      misses = 0;
-    } else {
-      // Coast on the prediction (which heads toward the landing point if set).
-      nx = predX;
-      ny = predY;
-      confidence = 0;
-      misses++;
-    }
-
-    const newVx = nx - px;
-    const newVy = ny - py;
-    const s = opts.velocitySmoothing;
-    vx = s * vx + (1 - s) * newVx;
-    vy = s * vy + (1 - s) * newVy;
-    px = nx;
-    py = ny;
-
-    points.push({
-      frame: cur.frame,
-      t: cur.t,
-      x: nx,
-      y: ny,
-      confidence,
-      manual: false,
-    });
-
-    // Without a landing target, give up after too many misses; with one, keep
-    // coasting so the arc completes to the known landing spot.
-    if (!end && misses >= opts.maxMisses) break;
+    candidates.push(findCandidates(frames[n], frames[n - 1], template, opts, roi));
   }
 
-  // Anchor the arc to the exact landing point the user chose.
+  // Model anchored at the seed (t=0): x = mx·t + seed.x, y = ay·t² + by·t + seed.y
+  let mx = 0;
+  let ay = 0;
+  let by = 0;
+  if (end && tEnd > 0) {
+    mx = (end.x - seed.x) / tEnd;
+    by = (end.y - seed.y) / tEnd; // straight start; curvature comes from fit
+  }
+
+  const diag = Math.hypot(frames[0].width, frames[0].height);
+
+  // Iteratively assign the nearest in-gate candidate per frame, then refit.
+  for (let iter = 0; iter < 8; iter++) {
+    const sx: { t: number; v: number; w: number }[] = [{ t: 0, v: seed.x, w: 50 }];
+    const sy: { t: number; v: number; w: number }[] = [{ t: 0, v: seed.y, w: 50 }];
+    if (end) {
+      sx.push({ t: tEnd, v: end.x, w: 50 });
+      sy.push({ t: tEnd, v: end.y, w: 50 });
+    }
+    const gate = Math.max(diag * 0.05, diag * (0.13 - 0.009 * iter));
+    for (let n = 1; n < N; n++) {
+      if (end && n === tEnd) continue; // landing is already anchored
+      const predX = mx * n + seed.x;
+      const predY = ay * n * n + by * n + seed.y;
+      let best: Candidate | null = null;
+      let bestD = gate;
+      for (const c of candidates[n]) {
+        const d = Math.hypot(c.x - predX, c.y - predY);
+        if (d < bestD) {
+          bestD = d;
+          best = c;
+        }
+      }
+      if (best) {
+        sx.push({ t: n, v: best.x, w: best.score });
+        sy.push({ t: n, v: best.y, w: best.score });
+      }
+    }
+    mx = fitLinear(sx, seed.x);
+    const q = fitQuad(sy, seed.y);
+    ay = q.a;
+    by = q.b;
+  }
+
+  // Sample the fitted model per frame; mark confidence where a candidate backs it.
+  const points: TrackPoint[] = [];
+  for (let n = 0; n < N; n++) {
+    const x = mx * n + seed.x;
+    const y = ay * n * n + by * n + seed.y;
+    let support = 0;
+    if (n > 0) {
+      for (const c of candidates[n]) {
+        if (Math.hypot(c.x - x, c.y - y) < diag * 0.04) {
+          support = Math.max(support, Math.min(1, c.score));
+        }
+      }
+    }
+    points.push({
+      frame: frames[n].frame,
+      t: frames[n].t,
+      x,
+      y,
+      confidence: n === 0 ? 1 : support,
+      manual: n === 0,
+    });
+  }
+
   if (end && points.length > 1) {
     const last = points[points.length - 1];
     last.x = end.x;
@@ -309,5 +335,5 @@ export function trackBall(
     last.manual = true;
   }
 
-  return points;
+  return { points, candidates };
 }

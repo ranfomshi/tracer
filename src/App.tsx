@@ -3,9 +3,15 @@ import TracerStage from "./components/TracerStage";
 import {
   DEFAULT_OPTIONS,
   trackBall,
+  type Candidate,
   type Rect,
   type TrackPoint,
 } from "./lib/tracker";
+
+export interface DebugFrame {
+  t: number;
+  cands: Candidate[];
+}
 import { grabFrames } from "./lib/videoFrames";
 import { smoothPath } from "./lib/trajectory";
 import { recordCanvas, downloadBlob } from "./lib/export";
@@ -29,6 +35,8 @@ export default function App() {
   const [clock, setClock] = useState(0);
   const [busy, setBusy] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const [debug, setDebug] = useState(false);
+  const [debugFrames, setDebugFrames] = useState<DebugFrame[]>([]);
   const [status, setStatus] = useState<{ msg: string; kind: StatusKind }>({
     msg: "",
     kind: "",
@@ -167,19 +175,27 @@ export default function App() {
       );
       const frames = await grabFrames(v, scratch, seed.t, fps, count);
       const end = landing ? { x: landing.x, y: landing.y } : null;
-      const tracked = trackBall(
+      const result = trackBall(
         frames,
         { x: seed.x, y: seed.y },
         DEFAULT_OPTIONS,
         roi,
         end,
       );
-      setPoints(tracked);
+      setPoints(result.points);
+      setDebugFrames(
+        result.points.map((p, n) => ({ t: p.t, cands: result.candidates[n] ?? [] })),
+      );
       await seekToAsync(v, seed.t);
-      const hit = tracked.filter((p) => p.confidence > 0.1).length;
+      const hit = result.points.filter((p) => p.confidence > 0.1).length;
+      const detected = result.candidates.reduce((s, c) => s + c.length, 0);
       setStatus({
-        msg: `Traced ${tracked.length} frames (${hit} confident). Press play, or correct any stray points.`,
-        kind: "ok",
+        msg: `Traced ${result.points.length} frames — ${hit} backed by detections, ${detected} candidates found.${
+          detected === 0
+            ? " No ball detected: try Limit area, check fps, or loosen detection."
+            : " Toggle Debug to see what was detected."
+        }`,
+        kind: detected === 0 ? "error" : "ok",
       });
     } catch (err) {
       setStatus({ msg: `Tracing failed: ${(err as Error).message}`, kind: "error" });
@@ -300,6 +316,8 @@ export default function App() {
             roi={roi}
             landing={landing}
             showGuides={!exporting}
+            debug={debug && !exporting}
+            debugFrames={debugFrames}
             videoRef={videoRef}
             canvasRef={canvasRef}
             onPoint={handlePoint}
@@ -380,6 +398,13 @@ export default function App() {
             </div>
 
             <div className="row">
+              <button
+                className={debug ? "active" : ""}
+                onClick={() => setDebug((d) => !d)}
+                disabled={busy || debugFrames.length === 0}
+              >
+                ◴ Debug
+              </button>
               <button onClick={exportVideo} disabled={busy || displayPoints.length < 2}>
                 ⬇ Export video
               </button>
@@ -389,6 +414,7 @@ export default function App() {
               <button
                 onClick={() => {
                   setPoints([]);
+                  setDebugFrames([]);
                   setShareUrl("");
                   setStatus({ msg: "", kind: "" });
                 }}
@@ -401,6 +427,7 @@ export default function App() {
                   if (videoUrl) URL.revokeObjectURL(videoUrl);
                   setVideoUrl("");
                   setPoints([]);
+                  setDebugFrames([]);
                   setRoi(null);
                   setLanding(null);
                 }}

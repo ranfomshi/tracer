@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import type { Rect, TrackPoint } from "../lib/tracker";
+import type { Candidate, Rect, TrackPoint } from "../lib/tracker";
 import { progressAtTime } from "../lib/trajectory";
 
 type Mode = "seed" | "correct" | "view" | "roi" | "land";
@@ -12,6 +12,9 @@ interface Props {
   landing: { x: number; y: number } | null;
   /** Whether to draw editing guides (ROI box, landing marker); off in export. */
   showGuides: boolean;
+  /** Whether to draw the raw detection candidates for the current frame. */
+  debug: boolean;
+  debugFrames: { t: number; cands: Candidate[] }[];
   videoRef: React.RefObject<HTMLVideoElement>;
   canvasRef: React.RefObject<HTMLCanvasElement>;
   onPoint: (x: number, y: number) => void;
@@ -27,6 +30,8 @@ export default function TracerStage({
   roi,
   landing,
   showGuides,
+  debug,
+  debugFrames,
   videoRef,
   canvasRef,
   onPoint,
@@ -43,6 +48,10 @@ export default function TracerStage({
   landingRef.current = landing;
   const showGuidesRef = useRef(showGuides);
   showGuidesRef.current = showGuides;
+  const debugRef = useRef(debug);
+  debugRef.current = debug;
+  const debugFramesRef = useRef(debugFrames);
+  debugFramesRef.current = debugFrames;
 
   // Live ROI drag (not committed until mouse-up).
   const dragStartRef = useRef<{ x: number; y: number } | null>(null);
@@ -65,6 +74,9 @@ export default function TracerStage({
       if (showGuidesRef.current) {
         drawRoi(ctx, dragRectRef.current ?? roiRef.current, w, h);
         if (landingRef.current) drawLanding(ctx, landingRef.current);
+      }
+      if (debugRef.current) {
+        drawDebug(ctx, debugFramesRef.current, video.currentTime);
       }
       drawTrail(ctx, pointsRef.current, video.currentTime);
       raf = requestAnimationFrame(draw);
@@ -171,6 +183,35 @@ function drawRoi(
   ctx.lineWidth = 2;
   ctx.setLineDash([8, 6]);
   ctx.strokeRect(roi.x, roi.y, roi.w, roi.h);
+  ctx.restore();
+}
+
+function drawDebug(
+  ctx: CanvasRenderingContext2D,
+  frames: { t: number; cands: Candidate[] }[],
+  time: number,
+) {
+  if (frames.length === 0) return;
+  // Pick the debug frame nearest the current playback time.
+  let best = frames[0];
+  let bestD = Infinity;
+  for (const f of frames) {
+    const d = Math.abs(f.t - time);
+    if (d < bestD) {
+      bestD = d;
+      best = f;
+    }
+  }
+  const maxScore = best.cands.reduce((m, c) => Math.max(m, c.score), 1);
+  ctx.save();
+  for (const c of best.cands) {
+    const radius = 4 + 10 * Math.min(1, c.score / maxScore);
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, radius, 0, Math.PI * 2);
+    ctx.strokeStyle = "rgba(250, 204, 21, 0.95)";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
   ctx.restore();
 }
 
