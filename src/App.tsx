@@ -20,6 +20,7 @@ interface TraceCtx {
   frameMeta: { frame: number; t: number }[];
   diag: number;
   seedT: number;
+  dt: number;
 }
 import { grabFrames } from "./lib/videoFrames";
 import { smoothPath } from "./lib/trajectory";
@@ -29,7 +30,9 @@ import { saveTrace, getTrace } from "./lib/api";
 type Mode = "view" | "seed" | "correct" | "roi" | "land";
 type StatusKind = "" | "ok" | "error";
 
-const MAX_TRACK_SECONDS = 5;
+// Cap only the no-landing case; with a landing point we trace the exact window.
+const MAX_TRACK_SECONDS = 8;
+const MAX_TRACK_FRAMES = 360;
 
 export default function App() {
   const [videoUrl, setVideoUrl] = useState<string>("");
@@ -161,7 +164,7 @@ export default function App() {
       // then re-fit the whole arc through every anchor.
       const n = Math.max(
         0,
-        Math.min(ctx.frameMeta.length - 1, Math.round((t - ctx.seedT) * fps)),
+        Math.min(ctx.frameMeta.length - 1, Math.round((t - ctx.seedT) / ctx.dt)),
       );
       const next: Anchor[] = [
         ...anchors.filter((a) => a.n !== n),
@@ -185,17 +188,18 @@ export default function App() {
     try {
       v.pause();
       const scratch = document.createElement("canvas");
-      // If a landing point was set after impact, trace exactly that window;
-      // otherwise grab up to MAX_TRACK_SECONDS of footage.
+      // With a landing point, trace the EXACT impact→landing window so the last
+      // sampled frame lands on it; otherwise grab up to MAX_TRACK_SECONDS.
       const useLanding = landing && landing.t > seed.t;
-      const span = useLanding
-        ? Math.min(landing!.t - seed.t, MAX_TRACK_SECONDS)
-        : Math.min(MAX_TRACK_SECONDS, Math.max(0, meta.duration - seed.t));
-      const count = Math.min(
-        Math.ceil(span * fps) + 1,
-        Math.ceil(MAX_TRACK_SECONDS * 120),
-      );
-      const frames = await grabFrames(v, scratch, seed.t, fps, count);
+      const targetT = useLanding
+        ? landing!.t
+        : Math.min(seed.t + MAX_TRACK_SECONDS, meta.duration);
+      const fullSpan = Math.max(0, targetT - seed.t);
+      const naturalCount = Math.ceil(fullSpan * fps) + 1;
+      const count = Math.max(2, Math.min(naturalCount, MAX_TRACK_FRAMES));
+      // Even time spacing across the window (subsamples long / slow-mo clips).
+      const dt = count > 1 ? fullSpan / (count - 1) : 1 / fps;
+      const frames = await grabFrames(v, scratch, seed.t, dt, count);
       const end = landing ? { x: landing.x, y: landing.y } : null;
       const result = trackBall(
         frames,
@@ -212,6 +216,7 @@ export default function App() {
         frameMeta,
         diag: Math.hypot(meta.w, meta.h),
         seedT: seed.t,
+        dt,
       };
       const initialAnchors: Anchor[] = [{ n: 0, x: seed.x, y: seed.y }];
       if (end) initialAnchors.push({ n: frames.length - 1, x: end.x, y: end.y });

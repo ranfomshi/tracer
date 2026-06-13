@@ -20,15 +20,16 @@ export function seekTo(video: HTMLVideoElement, time: number): Promise<void> {
 }
 
 /**
- * Grab a consecutive run of frames starting at `startTime`, stepping by 1/fps,
- * up to `count` frames (bounded by video duration). Draws each frame to the
- * provided scratch canvas to read back RGBA pixels.
+ * Grab `count` frames starting at `startTime`, stepping by `dt` seconds, up to
+ * the video duration. Draws each frame to the provided scratch canvas to read
+ * back RGBA pixels. Using an explicit `dt` lets the caller span an exact window
+ * (e.g. impact→landing) and, if needed, subsample long/slow-mo clips.
  */
 export async function grabFrames(
   video: HTMLVideoElement,
   canvas: HTMLCanvasElement,
   startTime: number,
-  fps: number,
+  dt: number,
   count: number,
 ): Promise<Frame[]> {
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
@@ -39,21 +40,14 @@ export async function grabFrames(
   canvas.width = width;
   canvas.height = height;
 
-  const dt = 1 / fps;
   const frames: Frame[] = [];
   for (let n = 0; n < count; n++) {
     const t = startTime + n * dt;
-    if (t > (video.duration || 0)) break;
+    if (t > (video.duration || 0) + 1e-3) break;
     await seekTo(video, t);
     ctx.drawImage(video, 0, 0, width, height);
     const img = ctx.getImageData(0, 0, width, height);
-    frames.push({
-      frame: Math.round(t * fps),
-      t,
-      data: img.data,
-      width,
-      height,
-    });
+    frames.push({ frame: n, t, data: img.data, width, height });
   }
   return frames;
 }
