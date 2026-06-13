@@ -195,52 +195,198 @@ function findCandidates(
   return cands.slice(0, 6);
 }
 
-/** Weighted least-squares slope m for v = m·t + c0 (c0 fixed = anchor). */
-function fitLinear(s: { t: number; v: number; w: number }[], c0: number): number {
-  let num = 0;
-  let den = 0;
-  for (const p of s) {
-    num += p.w * p.t * (p.v - c0);
-    den += p.w * p.t * p.t;
-  }
-  return den > 1e-9 ? num / den : 0;
+/** A user-placed anchor the path must pass through (0 = impact frame). */
+export interface Anchor {
+  n: number;
+  x: number;
+  y: number;
 }
 
-/** Weighted least-squares a,b for v = a·t² + b·t + c0 (c0 fixed = anchor). */
-function fitQuad(
-  s: { t: number; v: number; w: number }[],
-  c0: number,
-): { a: number; b: number } {
-  let St4 = 0;
-  let St3 = 0;
+type Sample = { t: number; v: number; w: number };
+
+/** Weighted least squares for v = m·t + b. */
+function fitLinear(s: Sample[]): { m: number; b: number } {
+  let Sw = 0;
+  let St = 0;
   let St2 = 0;
-  let Sr2 = 0;
-  let Sr1 = 0;
+  let Sv = 0;
+  let Stv = 0;
+  for (const p of s) {
+    Sw += p.w;
+    St += p.w * p.t;
+    St2 += p.w * p.t * p.t;
+    Sv += p.w * p.v;
+    Stv += p.w * p.t * p.v;
+  }
+  const det = St2 * Sw - St * St;
+  if (Math.abs(det) < 1e-9) return { m: 0, b: Sw > 0 ? Sv / Sw : 0 };
+  return { m: (Stv * Sw - Sv * St) / det, b: (St2 * Sv - St * Stv) / det };
+}
+
+/** Weighted least squares for v = a·t² + b·t + c. */
+function fitQuad(s: Sample[]): { a: number; b: number; c: number } {
+  let S0 = 0;
+  let S1 = 0;
+  let S2 = 0;
+  let S3 = 0;
+  let S4 = 0;
+  let T0 = 0;
+  let T1 = 0;
+  let T2 = 0;
   for (const p of s) {
     const t = p.t;
     const w = p.w;
-    const r = p.v - c0;
     const t2 = t * t;
-    St4 += w * t2 * t2;
-    St3 += w * t2 * t;
-    St2 += w * t2;
-    Sr2 += w * t2 * r;
-    Sr1 += w * t * r;
+    S0 += w;
+    S1 += w * t;
+    S2 += w * t2;
+    S3 += w * t2 * t;
+    S4 += w * t2 * t2;
+    T0 += w * p.v;
+    T1 += w * t * p.v;
+    T2 += w * t2 * p.v;
   }
-  const det = St4 * St2 - St3 * St3;
+  const m = [
+    [S4, S3, S2],
+    [S3, S2, S1],
+    [S2, S1, S0],
+  ];
+  const det = det3(m);
   if (Math.abs(det) < 1e-9) {
-    // Not enough curvature info — fall back to a straight line.
-    return { a: 0, b: St2 > 1e-9 ? Sr1 / St2 : 0 };
+    const lin = fitLinear(s); // not enough curvature info → straight line
+    return { a: 0, b: lin.m, c: lin.b };
   }
+  const rhs = [T2, T1, T0];
   return {
-    a: (Sr2 * St2 - Sr1 * St3) / det,
-    b: (St4 * Sr1 - St3 * Sr2) / det,
+    a: det3(replaceCol(m, 0, rhs)) / det,
+    b: det3(replaceCol(m, 1, rhs)) / det,
+    c: det3(replaceCol(m, 2, rhs)) / det,
   };
 }
 
+function det3(m: number[][]): number {
+  return (
+    m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) -
+    m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+    m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+  );
+}
+
+function replaceCol(m: number[][], col: number, v: number[]): number[][] {
+  return m.map((row, r) => row.map((val, c) => (c === col ? v[r] : val)));
+}
+
+const ANCHOR_WEIGHT = 400;
+
 /**
- * Trace the ball across consecutive frames (frames[0] is the impact/seed
- * frame). Returns the fitted physics path plus per-frame candidates.
+ * Fit the physics path — x linear, y quadratic in frame index — through the
+ * user anchors (heavily weighted, so the path passes through every click) and
+ * the per-frame detection candidates. Iterates: assign a candidate per frame,
+ * refit, tightening a gate so off-trajectory false positives drop out. The
+ * first pass trusts the strongest blob per frame to bootstrap the whole flight.
+ */
+export function fitTrajectory(
+  candidates: Candidate[][],
+  frameMeta: { frame: number; t: number }[],
+  anchors: Anchor[],
+  diag: number,
+): TrackPoint[] {
+  const N = frameMeta.length;
+  if (N === 0) return [];
+  const anchorByN = new Map<number, Anchor>();
+  for (const a of anchors) anchorByN.set(a.n, a);
+
+  let mx = 0;
+  let bx = anchors[0]?.x ?? 0;
+  let ay = 0;
+  let by = 0;
+  let cy = anchors[0]?.y ?? 0;
+
+  for (let iter = 0; iter < 10; iter++) {
+    const sx: Sample[] = [];
+    const sy: Sample[] = [];
+    for (const a of anchors) {
+      sx.push({ t: a.n, v: a.x, w: ANCHOR_WEIGHT });
+      sy.push({ t: a.n, v: a.y, w: ANCHOR_WEIGHT });
+    }
+    const gate = Math.max(diag * 0.04, diag * (0.14 - 0.013 * iter));
+    for (let n = 0; n < N; n++) {
+      if (anchorByN.has(n)) continue;
+      const cands = candidates[n];
+      if (!cands || cands.length === 0) continue;
+      let pick: Candidate | null = null;
+      if (iter === 0) {
+        pick = cands[0]; // strongest blob — bootstrap the whole arc
+      } else {
+        const predX = mx * n + bx;
+        const predY = ay * n * n + by * n + cy;
+        let bestD = gate;
+        for (const c of cands) {
+          const d = Math.hypot(c.x - predX, c.y - predY);
+          if (d < bestD) {
+            bestD = d;
+            pick = c;
+          }
+        }
+      }
+      if (pick) {
+        sx.push({ t: n, v: pick.x, w: pick.score });
+        sy.push({ t: n, v: pick.y, w: pick.score });
+      }
+    }
+    const lx = fitLinear(sx);
+    mx = lx.m;
+    bx = lx.b;
+    const qy = fitQuad(sy);
+    ay = qy.a;
+    by = qy.b;
+    cy = qy.c;
+  }
+
+  const points: TrackPoint[] = [];
+  for (let n = 0; n < N; n++) {
+    const anchor = anchorByN.get(n);
+    const x = anchor ? anchor.x : mx * n + bx;
+    const y = anchor ? anchor.y : ay * n * n + by * n + cy;
+    let support = anchor ? 1 : 0;
+    if (!anchor) {
+      for (const c of candidates[n] ?? []) {
+        if (Math.hypot(c.x - x, c.y - y) < diag * 0.04) {
+          support = Math.max(support, Math.min(1, c.score));
+        }
+      }
+    }
+    points.push({
+      frame: frameMeta[n].frame,
+      t: frameMeta[n].t,
+      x,
+      y,
+      confidence: support,
+      manual: !!anchor,
+    });
+  }
+  return points;
+}
+
+/** Detect per-frame candidates for a whole sequence (frames[0] = seed frame). */
+export function detectCandidates(
+  frames: Frame[],
+  seed: { x: number; y: number },
+  opts: TrackOptions = DEFAULT_OPTIONS,
+  roi?: Rect | null,
+): Candidate[][] {
+  if (frames.length === 0) return [];
+  const template = sampleColor(frames[0], seed.x, seed.y, 3);
+  const out: Candidate[][] = [[]];
+  for (let n = 1; n < frames.length; n++) {
+    out.push(findCandidates(frames[n], frames[n - 1], template, opts, roi));
+  }
+  return out;
+}
+
+/**
+ * Convenience: detect candidates then fit, anchored at the impact point (and
+ * the landing point if given). frames[0] is the impact/seed frame.
  */
 export function trackBall(
   frames: Frame[],
@@ -250,90 +396,11 @@ export function trackBall(
   end?: { x: number; y: number } | null,
 ): TraceResult {
   if (frames.length === 0) return { points: [], candidates: [] };
-
-  const template = sampleColor(frames[0], seed.x, seed.y, 3);
-  const N = frames.length;
-  const tEnd = N - 1;
-
-  const candidates: Candidate[][] = [[]];
-  for (let n = 1; n < N; n++) {
-    candidates.push(findCandidates(frames[n], frames[n - 1], template, opts, roi));
-  }
-
-  // Model anchored at the seed (t=0): x = mx·t + seed.x, y = ay·t² + by·t + seed.y
-  let mx = 0;
-  let ay = 0;
-  let by = 0;
-  if (end && tEnd > 0) {
-    mx = (end.x - seed.x) / tEnd;
-    by = (end.y - seed.y) / tEnd; // straight start; curvature comes from fit
-  }
-
+  const candidates = detectCandidates(frames, seed, opts, roi);
+  const frameMeta = frames.map((f) => ({ frame: f.frame, t: f.t }));
   const diag = Math.hypot(frames[0].width, frames[0].height);
-
-  // Iteratively assign the nearest in-gate candidate per frame, then refit.
-  for (let iter = 0; iter < 8; iter++) {
-    const sx: { t: number; v: number; w: number }[] = [{ t: 0, v: seed.x, w: 50 }];
-    const sy: { t: number; v: number; w: number }[] = [{ t: 0, v: seed.y, w: 50 }];
-    if (end) {
-      sx.push({ t: tEnd, v: end.x, w: 50 });
-      sy.push({ t: tEnd, v: end.y, w: 50 });
-    }
-    const gate = Math.max(diag * 0.05, diag * (0.13 - 0.009 * iter));
-    for (let n = 1; n < N; n++) {
-      if (end && n === tEnd) continue; // landing is already anchored
-      const predX = mx * n + seed.x;
-      const predY = ay * n * n + by * n + seed.y;
-      let best: Candidate | null = null;
-      let bestD = gate;
-      for (const c of candidates[n]) {
-        const d = Math.hypot(c.x - predX, c.y - predY);
-        if (d < bestD) {
-          bestD = d;
-          best = c;
-        }
-      }
-      if (best) {
-        sx.push({ t: n, v: best.x, w: best.score });
-        sy.push({ t: n, v: best.y, w: best.score });
-      }
-    }
-    mx = fitLinear(sx, seed.x);
-    const q = fitQuad(sy, seed.y);
-    ay = q.a;
-    by = q.b;
-  }
-
-  // Sample the fitted model per frame; mark confidence where a candidate backs it.
-  const points: TrackPoint[] = [];
-  for (let n = 0; n < N; n++) {
-    const x = mx * n + seed.x;
-    const y = ay * n * n + by * n + seed.y;
-    let support = 0;
-    if (n > 0) {
-      for (const c of candidates[n]) {
-        if (Math.hypot(c.x - x, c.y - y) < diag * 0.04) {
-          support = Math.max(support, Math.min(1, c.score));
-        }
-      }
-    }
-    points.push({
-      frame: frames[n].frame,
-      t: frames[n].t,
-      x,
-      y,
-      confidence: n === 0 ? 1 : support,
-      manual: n === 0,
-    });
-  }
-
-  if (end && points.length > 1) {
-    const last = points[points.length - 1];
-    last.x = end.x;
-    last.y = end.y;
-    last.confidence = 1;
-    last.manual = true;
-  }
-
+  const anchors: Anchor[] = [{ n: 0, x: seed.x, y: seed.y }];
+  if (end) anchors.push({ n: frames.length - 1, x: end.x, y: end.y });
+  const points = fitTrajectory(candidates, frameMeta, anchors, diag);
   return { points, candidates };
 }

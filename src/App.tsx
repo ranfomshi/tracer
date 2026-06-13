@@ -2,7 +2,9 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import TracerStage from "./components/TracerStage";
 import {
   DEFAULT_OPTIONS,
+  fitTrajectory,
   trackBall,
+  type Anchor,
   type Candidate,
   type Rect,
   type TrackPoint,
@@ -11,6 +13,13 @@ import {
 export interface DebugFrame {
   t: number;
   cands: Candidate[];
+}
+
+interface TraceCtx {
+  candidates: Candidate[][];
+  frameMeta: { frame: number; t: number }[];
+  diag: number;
+  seedT: number;
 }
 import { grabFrames } from "./lib/videoFrames";
 import { smoothPath } from "./lib/trajectory";
@@ -37,6 +46,7 @@ export default function App() {
   const [exporting, setExporting] = useState(false);
   const [debug, setDebug] = useState(false);
   const [debugFrames, setDebugFrames] = useState<DebugFrame[]>([]);
+  const [anchors, setAnchors] = useState<Anchor[]>([]);
   const [status, setStatus] = useState<{ msg: string; kind: StatusKind }>({
     msg: "",
     kind: "",
@@ -47,6 +57,7 @@ export default function App() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const traceCtxRef = useRef<TraceCtx | null>(null);
 
   const displayPoints = useMemo(() => smoothPath(points), [points]);
 
@@ -90,6 +101,9 @@ export default function App() {
       return URL.createObjectURL(file);
     });
     setPoints([]);
+    setDebugFrames([]);
+    setAnchors([]);
+    traceCtxRef.current = null;
     setRoi(null);
     setLanding(null);
     setShareUrl("");
@@ -113,6 +127,13 @@ export default function App() {
     if (v) v.currentTime = Math.max(0, Math.min(meta.duration, t));
   };
 
+  const stepFrame = (dir: number) => {
+    const v = videoRef.current;
+    if (!v) return;
+    v.pause();
+    v.currentTime = Math.max(0, Math.min(meta.duration, v.currentTime + dir / fps));
+  };
+
   const handlePoint = (x: number, y: number) => {
     const v = videoRef.current;
     if (!v) return;
@@ -134,23 +155,24 @@ export default function App() {
         kind: "ok",
       });
     } else if (mode === "correct") {
-      setPoints((prev) => {
-        if (prev.length === 0) return prev;
-        // Snap the correction onto the nearest tracked frame.
-        let best = 0;
-        let bestDist = Infinity;
-        prev.forEach((p, i) => {
-          const d = Math.abs(p.t - t);
-          if (d < bestDist) {
-            bestDist = d;
-            best = i;
-          }
-        });
-        const next = prev.slice();
-        next[best] = { ...next[best], x, y, confidence: 1, manual: true };
-        return next;
+      const ctx = traceCtxRef.current;
+      if (!ctx) return;
+      // Map the current time to a frame index and add/replace an anchor there,
+      // then re-fit the whole arc through every anchor.
+      const n = Math.max(
+        0,
+        Math.min(ctx.frameMeta.length - 1, Math.round((t - ctx.seedT) * fps)),
+      );
+      const next: Anchor[] = [
+        ...anchors.filter((a) => a.n !== n),
+        { n, x, y },
+      ].sort((a, b) => a.n - b.n);
+      setAnchors(next);
+      setPoints(fitTrajectory(ctx.candidates, ctx.frameMeta, next, ctx.diag));
+      setStatus({
+        msg: `Anchor set on this frame (${next.length} total). Arc re-fitted — add more to refine.`,
+        kind: "ok",
       });
-      setStatus({ msg: "Point corrected.", kind: "ok" });
     }
   };
 
@@ -182,6 +204,18 @@ export default function App() {
         roi,
         end,
       );
+      // Cache the detection context so manual corrections can re-fit instantly
+      // (no re-grabbing of frames).
+      const frameMeta = result.points.map((p) => ({ frame: p.frame, t: p.t }));
+      traceCtxRef.current = {
+        candidates: result.candidates,
+        frameMeta,
+        diag: Math.hypot(meta.w, meta.h),
+        seedT: seed.t,
+      };
+      const initialAnchors: Anchor[] = [{ n: 0, x: seed.x, y: seed.y }];
+      if (end) initialAnchors.push({ n: frames.length - 1, x: end.x, y: end.y });
+      setAnchors(initialAnchors);
       setPoints(result.points);
       setDebugFrames(
         result.points.map((p, n) => ({ t: p.t, cands: result.candidates[n] ?? [] })),
@@ -257,7 +291,7 @@ export default function App() {
     mode === "seed"
       ? "Click the <b>ball</b> on this frame to set its starting point."
       : mode === "correct"
-        ? "Click where the ball actually is to <b>fix</b> the nearest point."
+        ? "Step to a frame and click the <b>ball</b> to anchor it — the arc re-fits through every anchor."
         : mode === "land"
           ? "Scrub to where the ball <b>lands</b>, then click the spot."
           : mode === "roi"
@@ -334,6 +368,12 @@ export default function App() {
               <button onClick={pause} disabled={busy}>
                 ⏸ Pause
               </button>
+              <button onClick={() => stepFrame(-1)} disabled={busy} title="Previous frame">
+                ⏮ Frame
+              </button>
+              <button onClick={() => stepFrame(1)} disabled={busy} title="Next frame">
+                Frame ⏭
+              </button>
               <input
                 type="range"
                 min={0}
@@ -343,7 +383,7 @@ export default function App() {
                 onChange={(e) => seekTo(parseFloat(e.target.value))}
               />
               <span className="time">
-                {clock.toFixed(2)}s / {(meta.duration || 0).toFixed(2)}s
+                {clock.toFixed(2)}s · f{Math.round(clock * fps)}
               </span>
             </div>
 
@@ -379,9 +419,9 @@ export default function App() {
               <button
                 className={mode === "correct" ? "active" : ""}
                 onClick={() => setMode(mode === "correct" ? "view" : "correct")}
-                disabled={busy || points.length < 2}
+                disabled={busy || !traceCtxRef.current}
               >
-                ✎ Correct point
+                ✎ {anchors.length > 1 ? `Anchors (${anchors.length})` : "Add anchor"}
               </button>
               <label className="field">
                 fps
@@ -415,6 +455,8 @@ export default function App() {
                 onClick={() => {
                   setPoints([]);
                   setDebugFrames([]);
+                  setAnchors([]);
+                  traceCtxRef.current = null;
                   setShareUrl("");
                   setStatus({ msg: "", kind: "" });
                 }}
@@ -428,6 +470,8 @@ export default function App() {
                   setVideoUrl("");
                   setPoints([]);
                   setDebugFrames([]);
+                  setAnchors([]);
+                  traceCtxRef.current = null;
                   setRoi(null);
                   setLanding(null);
                 }}
