@@ -2,15 +2,16 @@ import { useEffect, useRef } from "react";
 import type { Rect, TrackPoint } from "../lib/tracker";
 import { progressAtTime } from "../lib/trajectory";
 
-type Mode = "seed" | "correct" | "view" | "roi";
+type Mode = "seed" | "correct" | "view" | "roi" | "land";
 
 interface Props {
   videoUrl: string;
   points: TrackPoint[];
   mode: Mode;
   roi: Rect | null;
-  /** Whether to draw the ROI box + dim overlay (suppressed during export). */
-  overlayRoi: boolean;
+  landing: { x: number; y: number } | null;
+  /** Whether to draw editing guides (ROI box, landing marker); off in export. */
+  showGuides: boolean;
   videoRef: React.RefObject<HTMLVideoElement>;
   canvasRef: React.RefObject<HTMLCanvasElement>;
   onPoint: (x: number, y: number) => void;
@@ -24,7 +25,8 @@ export default function TracerStage({
   points,
   mode,
   roi,
-  overlayRoi,
+  landing,
+  showGuides,
   videoRef,
   canvasRef,
   onPoint,
@@ -37,8 +39,10 @@ export default function TracerStage({
   pointsRef.current = points;
   const roiRef = useRef(roi);
   roiRef.current = roi;
-  const overlayRoiRef = useRef(overlayRoi);
-  overlayRoiRef.current = overlayRoi;
+  const landingRef = useRef(landing);
+  landingRef.current = landing;
+  const showGuidesRef = useRef(showGuides);
+  showGuidesRef.current = showGuides;
 
   // Live ROI drag (not committed until mouse-up).
   const dragStartRef = useRef<{ x: number; y: number } | null>(null);
@@ -58,8 +62,9 @@ export default function TracerStage({
       if (w && h && video.readyState >= 2) {
         ctx.drawImage(video, 0, 0, w, h);
       }
-      if (overlayRoiRef.current) {
+      if (showGuidesRef.current) {
         drawRoi(ctx, dragRectRef.current ?? roiRef.current, w, h);
+        if (landingRef.current) drawLanding(ctx, landingRef.current);
       }
       drawTrail(ctx, pointsRef.current, video.currentTime);
       raf = requestAnimationFrame(draw);
@@ -166,6 +171,26 @@ function drawRoi(
   ctx.lineWidth = 2;
   ctx.setLineDash([8, 6]);
   ctx.strokeRect(roi.x, roi.y, roi.w, roi.h);
+  ctx.restore();
+}
+
+function drawLanding(
+  ctx: CanvasRenderingContext2D,
+  p: { x: number; y: number },
+) {
+  ctx.save();
+  ctx.strokeStyle = "rgba(45, 212, 191, 0.95)";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, 10, 0, Math.PI * 2);
+  ctx.stroke();
+  // Crosshair through the centre.
+  ctx.beginPath();
+  ctx.moveTo(p.x - 14, p.y);
+  ctx.lineTo(p.x + 14, p.y);
+  ctx.moveTo(p.x, p.y - 14);
+  ctx.lineTo(p.x, p.y + 14);
+  ctx.stroke();
   ctx.restore();
 }
 

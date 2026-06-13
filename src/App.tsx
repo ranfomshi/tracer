@@ -11,7 +11,7 @@ import { smoothPath } from "./lib/trajectory";
 import { recordCanvas, downloadBlob } from "./lib/export";
 import { saveTrace, getTrace } from "./lib/api";
 
-type Mode = "view" | "seed" | "correct" | "roi";
+type Mode = "view" | "seed" | "correct" | "roi" | "land";
 type StatusKind = "" | "ok" | "error";
 
 const MAX_TRACK_SECONDS = 5;
@@ -22,6 +22,9 @@ export default function App() {
   const [fps, setFps] = useState(30);
   const [points, setPoints] = useState<TrackPoint[]>([]);
   const [roi, setRoi] = useState<Rect | null>(null);
+  const [landing, setLanding] = useState<{ x: number; y: number; t: number } | null>(
+    null,
+  );
   const [mode, setMode] = useState<Mode>("view");
   const [clock, setClock] = useState(0);
   const [busy, setBusy] = useState(false);
@@ -80,6 +83,7 @@ export default function App() {
     });
     setPoints([]);
     setRoi(null);
+    setLanding(null);
     setShareUrl("");
     setMode("view");
     setStatus({ msg: "", kind: "" });
@@ -111,7 +115,14 @@ export default function App() {
       setPoints([{ frame, t, x, y, confidence: 1, manual: true }]);
       setMode("view");
       setStatus({
-        msg: "Ball start set. Hit “Trace shot” to follow the flight.",
+        msg: "Impact point set. Optionally set the landing point, then “Trace shot”.",
+        kind: "ok",
+      });
+    } else if (mode === "land") {
+      setLanding({ x, y, t });
+      setMode("view");
+      setStatus({
+        msg: "Landing point set — the trace will end here and stay on track toward it.",
         kind: "ok",
       });
     } else if (mode === "correct") {
@@ -144,17 +155,24 @@ export default function App() {
     try {
       v.pause();
       const scratch = document.createElement("canvas");
-      const remaining = Math.max(0, meta.duration - seed.t);
+      // If a landing point was set after impact, trace exactly that window;
+      // otherwise grab up to MAX_TRACK_SECONDS of footage.
+      const useLanding = landing && landing.t > seed.t;
+      const span = useLanding
+        ? Math.min(landing!.t - seed.t, MAX_TRACK_SECONDS)
+        : Math.min(MAX_TRACK_SECONDS, Math.max(0, meta.duration - seed.t));
       const count = Math.min(
-        Math.ceil(Math.min(MAX_TRACK_SECONDS, remaining) * fps),
+        Math.ceil(span * fps) + 1,
         Math.ceil(MAX_TRACK_SECONDS * 120),
       );
       const frames = await grabFrames(v, scratch, seed.t, fps, count);
+      const end = landing ? { x: landing.x, y: landing.y } : null;
       const tracked = trackBall(
         frames,
         { x: seed.x, y: seed.y },
         DEFAULT_OPTIONS,
         roi,
+        end,
       );
       setPoints(tracked);
       await seekToAsync(v, seed.t);
@@ -224,9 +242,11 @@ export default function App() {
       ? "Click the <b>ball</b> on this frame to set its starting point."
       : mode === "correct"
         ? "Click where the ball actually is to <b>fix</b> the nearest point."
-        : mode === "roi"
-          ? "Drag to box the <b>area the ball stays within</b>. Outside is ignored. Tiny box = clear."
-          : "";
+        : mode === "land"
+          ? "Scrub to where the ball <b>lands</b>, then click the spot."
+          : mode === "roi"
+            ? "Drag to box the <b>area the ball stays within</b>. Outside is ignored. Tiny box = clear."
+            : "";
 
   return (
     <div className="app">
@@ -278,7 +298,8 @@ export default function App() {
             points={displayPoints}
             mode={mode}
             roi={roi}
-            overlayRoi={!exporting}
+            landing={landing}
+            showGuides={!exporting}
             videoRef={videoRef}
             canvasRef={canvasRef}
             onPoint={handlePoint}
@@ -321,7 +342,14 @@ export default function App() {
                 onClick={() => setMode(mode === "seed" ? "view" : "seed")}
                 disabled={busy}
               >
-                ◎ Set ball start
+                ◎ Set impact
+              </button>
+              <button
+                className={mode === "land" ? "active" : landing ? "active" : ""}
+                onClick={() => setMode(mode === "land" ? "view" : "land")}
+                disabled={busy || points.length === 0}
+              >
+                ⊕ {landing ? "Edit landing" : "Set landing"}
               </button>
               <button
                 className="primary"
@@ -374,6 +402,7 @@ export default function App() {
                   setVideoUrl("");
                   setPoints([]);
                   setRoi(null);
+                  setLanding(null);
                 }}
                 disabled={busy}
               >

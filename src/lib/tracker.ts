@@ -1,13 +1,17 @@
 // Core ball-tracking logic. Runs entirely in the browser on canvas pixel data.
 //
-// Strategy: the golf ball is a small, bright object that moves fast relative to
-// the (mostly static) background. We seed the tracker with the ball's location
-// on the first frame, then for each subsequent frame we:
+// Strategy: the ball is a small object that MOVES relative to the (mostly
+// static) background — it may be lighter OR darker than what's behind it, so we
+// don't assume brightness. Instead we sample the ball's actual colour from the
+// user's seed click and, for each subsequent frame:
 //   1. compute a per-pixel "motion" signal by differencing consecutive frames,
-//   2. search a window around the position predicted from current velocity,
-//   3. score candidate pixels by motion * brightness and take the weighted
-//      centroid of the strongest cluster as the new ball position,
-//   4. update velocity (with smoothing) for the next prediction.
+//   2. among the moving pixels, score how well each matches the ball's colour
+//      template (this also rejects the frame-difference "ghost" left where the
+//      ball used to be, which now shows background),
+//   3. search a window around the predicted position and take the weighted
+//      centroid of the best-matching cluster,
+//   4. update velocity for the next prediction. An optional landing point pulls
+//      the prediction toward where the ball is known to come down.
 //
 // This is deliberately classical CV — no model downloads, no GPU required — so
 // it works offline and within a static Netlify deploy.
@@ -29,19 +33,26 @@ export interface TrackPoint {
 export interface TrackOptions {
   /** Half-width of the search window in pixels (scales with speed too). */
   searchRadius: number;
-  /** Pixel brightness/motion delta below which a pixel is ignored (0..255). */
+  /** Frame-difference delta below which a pixel is treated as static (0..255). */
   motionThreshold: number;
-  /** Stop tracking after this many consecutive low-confidence frames. */
+  /** Max colour distance (0..441) a pixel may be from the ball template. */
+  colorTolerance: number;
+  /** Stop tracking after this many consecutive misses (ignored if a landing
+   *  point is supplied — then we coast all the way to it). */
   maxMisses: number;
   /** Velocity smoothing factor 0..1 (higher = smoother, laggier). */
   velocitySmoothing: number;
+  /** How strongly the landing point pulls the prediction, 0..1. */
+  landingPull: number;
 }
 
 export const DEFAULT_OPTIONS: TrackOptions = {
   searchRadius: 60,
-  motionThreshold: 28,
+  motionThreshold: 22,
+  colorTolerance: 115,
   maxMisses: 6,
   velocitySmoothing: 0.45,
+  landingPull: 0.5,
 };
 
 /** A rectangular region in video pixel coordinates. */
@@ -61,29 +72,57 @@ export interface Frame {
   height: number;
 }
 
+interface RGB {
+  r: number;
+  g: number;
+  b: number;
+}
+
 interface Detection {
   x: number;
   y: number;
   confidence: number;
 }
 
-function luma(data: Uint8ClampedArray, i: number): number {
-  // Rec. 601 luminance. `i` is the index of the R channel.
-  return 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+function luma(r: number, g: number, b: number): number {
+  return 0.299 * r + 0.587 * g + 0.114 * b; // Rec. 601
+}
+
+/** Mean RGB of a small patch — the ball's appearance template. */
+function sampleColor(f: Frame, cx: number, cy: number, r: number): RGB {
+  const x0 = Math.max(0, Math.floor(cx - r));
+  const x1 = Math.min(f.width - 1, Math.ceil(cx + r));
+  const y0 = Math.max(0, Math.floor(cy - r));
+  const y1 = Math.min(f.height - 1, Math.ceil(cy + r));
+  let sr = 0;
+  let sg = 0;
+  let sb = 0;
+  let n = 0;
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      const i = (y * f.width + x) * 4;
+      sr += f.data[i];
+      sg += f.data[i + 1];
+      sb += f.data[i + 2];
+      n++;
+    }
+  }
+  return n ? { r: sr / n, g: sg / n, b: sb / n } : { r: 255, g: 255, b: 255 };
 }
 
 /**
- * Find the ball within a search window by scoring pixels on how much they
- * moved (frame difference) and how bright they are, then taking the
- * intensity-weighted centroid. Returns null if nothing crosses threshold.
+ * Find the ball within a search window. A pixel counts only if it MOVED since
+ * the previous frame and its colour resembles the ball template; we then take
+ * the weighted centroid. Returns null if nothing qualifies.
  */
 function detectInWindow(
   cur: Frame,
   prev: Frame,
+  template: RGB,
   cx: number,
   cy: number,
   radius: number,
-  threshold: number,
+  opts: TrackOptions,
   roi?: Rect | null,
 ): Detection | null {
   const { width, height } = cur;
@@ -111,14 +150,29 @@ function detectInWindow(
   for (let y = y0; y <= y1; y++) {
     for (let x = x0; x <= x1; x++) {
       const i = (y * width + x) * 4;
-      const motion = Math.abs(luma(cur.data, i) - luma(prev.data, i));
-      if (motion < threshold) continue;
-      const brightness = luma(cur.data, i) / 255; // favour the white ball
+      const r = cur.data[i];
+      const g = cur.data[i + 1];
+      const b = cur.data[i + 2];
+      const motion = Math.abs(
+        luma(r, g, b) - luma(prev.data[i], prev.data[i + 1], prev.data[i + 2]),
+      );
+      if (motion < opts.motionThreshold) continue;
+
+      // Colour similarity to the ball — works for light OR dark balls and
+      // rejects the ghost (sky) the ball moved away from.
+      const dr = r - template.r;
+      const dg = g - template.g;
+      const db = b - template.b;
+      const colorDist = Math.sqrt(dr * dr + dg * dg + db * db);
+      const sim = 1 - Math.min(1, colorDist / opts.colorTolerance);
+      if (sim <= 0) continue;
+
       // Distance falloff keeps us locked onto the predicted location.
-      const dx = (x - cx) / radius;
-      const dy = (y - cy) / radius;
-      const dist = Math.min(1, Math.sqrt(dx * dx + dy * dy));
-      const w = motion * (0.4 + 0.6 * brightness) * (1 - 0.6 * dist);
+      const ddx = (x - cx) / radius;
+      const ddy = (y - cy) / radius;
+      const dist = Math.min(1, Math.sqrt(ddx * ddx + ddy * ddy));
+
+      const w = Math.min(1, motion / 64) * sim * (1 - 0.6 * dist);
       if (w <= 0) continue;
       sumW += w;
       sumX += x * w;
@@ -130,28 +184,30 @@ function detectInWindow(
 
   if (sumW === 0 || count < 2) return null;
 
-  // Confidence: blend of how strong the signal is and how compact the blob is.
   const area = (x1 - x0 + 1) * (y1 - y0 + 1);
   const compactness = 1 - Math.min(1, count / area);
-  const strength = Math.min(1, peak / 180);
+  const strength = Math.min(1, peak / 0.6);
   const confidence = Math.max(0, Math.min(1, 0.5 * strength + 0.5 * compactness));
 
   return { x: sumX / sumW, y: sumY / sumW, confidence };
 }
 
 /**
- * Track the ball across a sequence of already-grabbed frames, starting from a
- * user-supplied seed position on `frames[0]`.
- *
- * `frames` must be consecutive and ordered; the seed corresponds to frames[0].
+ * Track the ball across a sequence of already-grabbed consecutive frames,
+ * starting from the seed position on `frames[0]`. If `end` (a landing point) is
+ * given, the prediction is pulled toward it and the final point is anchored to
+ * it exactly.
  */
 export function trackBall(
   frames: Frame[],
   seed: { x: number; y: number },
   opts: TrackOptions = DEFAULT_OPTIONS,
   roi?: Rect | null,
+  end?: { x: number; y: number } | null,
 ): TrackPoint[] {
   if (frames.length === 0) return [];
+
+  const template = sampleColor(frames[0], seed.x, seed.y, 3);
 
   const points: TrackPoint[] = [
     {
@@ -169,15 +225,26 @@ export function trackBall(
   let vx = 0;
   let vy = 0;
   let misses = 0;
+  const N = frames.length;
 
-  for (let n = 1; n < frames.length; n++) {
+  for (let n = 1; n < N; n++) {
     const prev = frames[n - 1];
     const cur = frames[n];
 
-    const predX = px + vx;
-    const predY = py + vy;
+    let predX = px + vx;
+    let predY = py + vy;
+    if (end) {
+      // Expected per-frame step if the remaining distance to the landing point
+      // were spread evenly over the remaining frames.
+      const remaining = Math.max(1, N - n);
+      const towardX = (end.x - px) / remaining;
+      const towardY = (end.y - py) / remaining;
+      const k = opts.landingPull;
+      predX = px + (1 - k) * vx + k * towardX;
+      predY = py + (1 - k) * vy + k * towardY;
+    }
+
     const speed = Math.hypot(vx, vy);
-    // Widen the search as the ball speeds up so we don't lose a fast shot.
     const radius = Math.min(
       Math.max(cur.width, cur.height) / 2,
       opts.searchRadius + speed * 1.5,
@@ -186,10 +253,11 @@ export function trackBall(
     const det = detectInWindow(
       cur,
       prev,
+      template,
       predX,
       predY,
       radius,
-      opts.motionThreshold,
+      opts,
       roi,
     );
 
@@ -203,7 +271,7 @@ export function trackBall(
       confidence = det.confidence;
       misses = 0;
     } else {
-      // Coast on the last velocity when we lose the ball briefly.
+      // Coast on the prediction (which heads toward the landing point if set).
       nx = predX;
       ny = predY;
       confidence = 0;
@@ -227,7 +295,18 @@ export function trackBall(
       manual: false,
     });
 
-    if (misses >= opts.maxMisses) break;
+    // Without a landing target, give up after too many misses; with one, keep
+    // coasting so the arc completes to the known landing spot.
+    if (!end && misses >= opts.maxMisses) break;
+  }
+
+  // Anchor the arc to the exact landing point the user chose.
+  if (end && points.length > 1) {
+    const last = points[points.length - 1];
+    last.x = end.x;
+    last.y = end.y;
+    last.confidence = 1;
+    last.manual = true;
   }
 
   return points;

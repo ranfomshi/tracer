@@ -12,13 +12,20 @@ Tracer does it with **classical computer vision in the browser** — no model
 downloads, no GPU, no video upload required:
 
 1. **Upload** a clip of a shot (MP4 / MOV / WebM). It stays on your machine.
-2. **Scrub** to the moment of impact and click the ball to seed the tracker.
-3. **Trace** — Tracer steps through the frames, differences consecutive frames
-   to isolate the fast-moving bright ball, and follows it with a velocity-
-   predicting search window.
-4. **Correct** any stray points with a click; the arc is smoothed and a
-   parabola is fit for that clean broadcast look.
-5. **Export** an annotated `.webm`, or **save & share** the trace via a link.
+2. **Set impact** — scrub to the strike and click the ball. Tracer samples the
+   ball's actual colour here, so it works whether the ball is *lighter or
+   darker* than the background (no "bright blob" assumption).
+3. *(Optional)* **Set landing** — scrub to where the ball comes down and click.
+   Tracer then traces exactly that window, stays on track toward the spot, and
+   anchors the arc to it.
+4. *(Optional)* **Limit area** — drag a box; detection ignores everything
+   outside it, killing false positives.
+5. **Trace** — Tracer steps through the frames, keeps only *moving* pixels that
+   match the ball's colour template, and follows it with a velocity-predicting
+   search window.
+6. **Correct** any stray points with a click; the arc is smoothed for a clean
+   broadcast look.
+7. **Export** an annotated `.webm`, or **save & share** the trace via a link.
 
 ### Pipeline
 
@@ -33,10 +40,12 @@ downloads, no GPU, no video upload required:
 
 ## Tips for good traces
 
-- A reasonably **static camera** and a **bright ball against a contrasting sky**
-  works best — that's what the motion + brightness scoring keys on.
+- A reasonably **static camera** helps most — motion is the primary cue.
+- Click the ball **precisely at impact**: that click is also the colour sample,
+  so land it on the ball, not the background.
+- **Set landing** for tricky shots — it bounds the trace and keeps it on track.
+- **Limit area** to a generous box around the whole expected flight path.
 - Set the **fps** field to match your clip (slow-mo footage especially).
-- Seed the ball **at or just before impact** for the cleanest arc.
 
 ## Develop
 
