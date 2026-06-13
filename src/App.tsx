@@ -96,6 +96,14 @@ export default function App() {
     return [...byN.values()].sort((a, b) => a.n - b.n);
   };
 
+  // Drop a computed trace (keeps the user's anchors) — used when the window-
+  // defining impact/landing changes and a fresh trace is needed.
+  const invalidateTrace = () => {
+    setPoints([]);
+    setDebugFrames([]);
+    traceCtxRef.current = null;
+  };
+
   // Re-fit from cached detections (used when anchors change after a trace).
   const refitFromCtx = (list: TAnchor[]) => {
     const ctx = traceCtxRef.current;
@@ -186,6 +194,9 @@ export default function App() {
     if (mode === "seed") {
       setImpact({ x, y, t });
       setMode("view");
+      // Impact defines the trace window (and colour template) — invalidate any
+      // existing trace so it's re-computed.
+      invalidateTrace();
       setStatus({
         msg: "Impact set. Add anchors on a few mid-flight frames and/or set the landing, then Trace shot.",
         kind: "ok",
@@ -193,10 +204,11 @@ export default function App() {
     } else if (mode === "land") {
       setLanding({ x, y, t });
       setMode("view");
-      const next = [...anchors, ...(impact ? [impact] : [])];
-      if (traceCtxRef.current) refitFromCtx([...next, { x, y, t }]);
+      // Landing defines the END of the trace window — must re-trace so the last
+      // frame is the one you marked, not the end of the clip.
+      invalidateTrace();
       setStatus({
-        msg: "Landing set — the arc ends here.",
+        msg: "Landing set — press Trace shot to fit the arc ending on this frame.",
         kind: "ok",
       });
     } else if (mode === "correct") {
