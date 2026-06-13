@@ -2,8 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import TracerStage from "./components/TracerStage";
 import {
   DEFAULT_OPTIONS,
+  detectCandidates,
   fitTrajectory,
-  trackBall,
   type Anchor,
   type Candidate,
   type Rect,
@@ -13,6 +13,14 @@ import {
 export interface DebugFrame {
   t: number;
   cands: Candidate[];
+}
+
+/** A user-placed ball position, stored in video time (mapped to a frame index
+ *  at fit time, since frame spacing depends on the chosen window). */
+interface TAnchor {
+  t: number;
+  x: number;
+  y: number;
 }
 
 interface TraceCtx {
@@ -40,16 +48,15 @@ export default function App() {
   const [fps, setFps] = useState(30);
   const [points, setPoints] = useState<TrackPoint[]>([]);
   const [roi, setRoi] = useState<Rect | null>(null);
-  const [landing, setLanding] = useState<{ x: number; y: number; t: number } | null>(
-    null,
-  );
+  const [impact, setImpact] = useState<TAnchor | null>(null);
+  const [landing, setLanding] = useState<TAnchor | null>(null);
   const [mode, setMode] = useState<Mode>("view");
   const [clock, setClock] = useState(0);
   const [busy, setBusy] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [debug, setDebug] = useState(false);
   const [debugFrames, setDebugFrames] = useState<DebugFrame[]>([]);
-  const [anchors, setAnchors] = useState<Anchor[]>([]);
+  const [anchors, setAnchors] = useState<TAnchor[]>([]);
   const [status, setStatus] = useState<{ msg: string; kind: StatusKind }>({
     msg: "",
     kind: "",
@@ -63,6 +70,39 @@ export default function App() {
   const traceCtxRef = useRef<TraceCtx | null>(null);
 
   const displayPoints = useMemo(() => smoothPath(points), [points]);
+
+  // All user-placed anchors (impact first, then mid-flight, then landing) as a
+  // single time-ordered list — the source of truth for both setup and re-fit.
+  const allAnchors = useMemo<TAnchor[]>(() => {
+    const list: TAnchor[] = [];
+    if (impact) list.push(impact);
+    list.push(...anchors);
+    if (landing) list.push(landing);
+    return list.sort((a, b) => a.t - b.t);
+  }, [impact, anchors, landing]);
+
+  // Map time-based anchors onto frame indices for a given window, de-duped.
+  const anchorsByFrame = (
+    list: TAnchor[],
+    seedT: number,
+    dt: number,
+    count: number,
+  ): Anchor[] => {
+    const byN = new Map<number, Anchor>();
+    for (const a of list) {
+      const n = Math.max(0, Math.min(count - 1, Math.round((a.t - seedT) / dt)));
+      byN.set(n, { n, x: a.x, y: a.y });
+    }
+    return [...byN.values()].sort((a, b) => a.n - b.n);
+  };
+
+  // Re-fit from cached detections (used when anchors change after a trace).
+  const refitFromCtx = (list: TAnchor[]) => {
+    const ctx = traceCtxRef.current;
+    if (!ctx) return;
+    const anchored = anchorsByFrame(list, ctx.seedT, ctx.dt, ctx.frameMeta.length);
+    setPoints(fitTrajectory(ctx.candidates, ctx.frameMeta, anchored, ctx.diag));
+  };
 
   // Keep the scrubber/clock in step with the video without re-rendering the
   // canvas (the stage drives its own rAF draw loop).
@@ -106,6 +146,7 @@ export default function App() {
     setPoints([]);
     setDebugFrames([]);
     setAnchors([]);
+    setImpact(null);
     traceCtxRef.current = null;
     setRoi(null);
     setLanding(null);
@@ -141,39 +182,44 @@ export default function App() {
     const v = videoRef.current;
     if (!v) return;
     const t = v.currentTime;
-    const frame = Math.round(t * fps);
 
     if (mode === "seed") {
-      setPoints([{ frame, t, x, y, confidence: 1, manual: true }]);
+      setImpact({ x, y, t });
       setMode("view");
       setStatus({
-        msg: "Impact point set. Optionally set the landing point, then “Trace shot”.",
+        msg: "Impact set. Add anchors on a few mid-flight frames and/or set the landing, then Trace shot.",
         kind: "ok",
       });
     } else if (mode === "land") {
       setLanding({ x, y, t });
       setMode("view");
+      const next = [...anchors, ...(impact ? [impact] : [])];
+      if (traceCtxRef.current) refitFromCtx([...next, { x, y, t }]);
       setStatus({
-        msg: "Landing point set — the trace will end here and stay on track toward it.",
+        msg: "Landing set — the arc ends here.",
         kind: "ok",
       });
     } else if (mode === "correct") {
-      const ctx = traceCtxRef.current;
-      if (!ctx) return;
-      // Map the current time to a frame index and add/replace an anchor there,
-      // then re-fit the whole arc through every anchor.
-      const n = Math.max(
-        0,
-        Math.min(ctx.frameMeta.length - 1, Math.round((t - ctx.seedT) / ctx.dt)),
+      // Add (or replace, if on the same frame) a mid-flight anchor. Works both
+      // before a trace (feeds the fit) and after (re-fits instantly).
+      const sameFrame = (a: TAnchor) =>
+        traceCtxRef.current
+          ? Math.round((a.t - traceCtxRef.current.seedT) / traceCtxRef.current.dt) ===
+            Math.round((t - traceCtxRef.current.seedT) / traceCtxRef.current.dt)
+          : Math.abs(a.t - t) < 0.5 / fps;
+      const next = [...anchors.filter((a) => !sameFrame(a)), { x, y, t }].sort(
+        (a, b) => a.t - b.t,
       );
-      const next: Anchor[] = [
-        ...anchors.filter((a) => a.n !== n),
-        { n, x, y },
-      ].sort((a, b) => a.n - b.n);
       setAnchors(next);
-      setPoints(fitTrajectory(ctx.candidates, ctx.frameMeta, next, ctx.diag));
+      if (traceCtxRef.current) {
+        const full = [...(impact ? [impact] : []), ...next, ...(landing ? [landing] : [])];
+        refitFromCtx(full);
+      }
+      const total = next.length + (impact ? 1 : 0) + (landing ? 1 : 0);
       setStatus({
-        msg: `Anchor set on this frame (${next.length} total). Arc re-fitted — add more to refine.`,
+        msg: traceCtxRef.current
+          ? `Anchor added — arc re-fitted (${total} anchors).`
+          : `Anchor added (${total} total). They'll guide the trace.`,
         kind: "ok",
       });
     }
@@ -181,8 +227,8 @@ export default function App() {
 
   const runTrace = async () => {
     const v = videoRef.current;
-    if (!v || points.length === 0) return;
-    const seed = points[0];
+    if (!v || !impact) return;
+    const seed = impact;
     setBusy(true);
     setStatus({ msg: "Tracing shot…", kind: "" });
     try {
@@ -200,36 +246,31 @@ export default function App() {
       // Even time spacing across the window (subsamples long / slow-mo clips).
       const dt = count > 1 ? fullSpan / (count - 1) : 1 / fps;
       const frames = await grabFrames(v, scratch, seed.t, dt, count);
-      const end = landing ? { x: landing.x, y: landing.y } : null;
-      const result = trackBall(
-        frames,
-        { x: seed.x, y: seed.y },
-        DEFAULT_OPTIONS,
-        roi,
-        end,
-      );
-      // Cache the detection context so manual corrections can re-fit instantly
-      // (no re-grabbing of frames).
-      const frameMeta = result.points.map((p) => ({ frame: p.frame, t: p.t }));
+      const candidates = detectCandidates(frames, { x: seed.x, y: seed.y }, DEFAULT_OPTIONS, roi);
+      const frameMeta = frames.map((f) => ({ frame: f.frame, t: f.t }));
+      const diag = Math.hypot(meta.w, meta.h);
+      // Map every user anchor (impact + mid-flight + landing) onto frame indices
+      // and fit through them; detection fills the gaps.
+      const anchored = anchorsByFrame(allAnchors, seed.t, dt, frames.length);
+      const tracked = fitTrajectory(candidates, frameMeta, anchored, diag);
+
+      // Cache the detection context so anchor edits re-fit instantly (no re-grab).
       traceCtxRef.current = {
-        candidates: result.candidates,
+        candidates,
         frameMeta,
-        diag: Math.hypot(meta.w, meta.h),
+        diag,
         seedT: seed.t,
         dt,
       };
-      const initialAnchors: Anchor[] = [{ n: 0, x: seed.x, y: seed.y }];
-      if (end) initialAnchors.push({ n: frames.length - 1, x: end.x, y: end.y });
-      setAnchors(initialAnchors);
-      setPoints(result.points);
+      setPoints(tracked);
       setDebugFrames(
-        result.points.map((p, n) => ({ t: p.t, cands: result.candidates[n] ?? [] })),
+        tracked.map((p, n) => ({ t: p.t, cands: candidates[n] ?? [] })),
       );
       await seekToAsync(v, seed.t);
-      const hit = result.points.filter((p) => p.confidence > 0.1).length;
-      const detected = result.candidates.reduce((s, c) => s + c.length, 0);
+      const hit = tracked.filter((p) => p.confidence > 0.1).length;
+      const detected = candidates.reduce((s, c) => s + c.length, 0);
       setStatus({
-        msg: `Traced ${result.points.length} frames — ${hit} backed by detections, ${detected} candidates found.${
+        msg: `Traced ${tracked.length} frames — ${hit} backed by detections, ${detected} candidates found.${
           detected === 0
             ? " No ball detected: try Limit area, check fps, or loosen detection."
             : " Toggle Debug to see what was detected."
@@ -296,7 +337,7 @@ export default function App() {
     mode === "seed"
       ? "Click the <b>ball</b> on this frame to set its starting point."
       : mode === "correct"
-        ? "Step to a frame and click the <b>ball</b> to anchor it — the arc re-fits through every anchor."
+        ? "Step to a frame and click the <b>ball</b> to anchor it. Add several across the flight — the trace fits through every anchor."
         : mode === "land"
           ? "Scrub to where the ball <b>lands</b>, then click the spot."
           : mode === "roi"
@@ -354,6 +395,10 @@ export default function App() {
             mode={mode}
             roi={roi}
             landing={landing}
+            markers={[...(impact ? [impact] : []), ...anchors].map((a) => ({
+              x: a.x,
+              y: a.y,
+            }))}
             showGuides={!exporting}
             debug={debug && !exporting}
             debugFrames={debugFrames}
@@ -401,32 +446,32 @@ export default function App() {
                 ▦ {roi ? "Edit area" : "Limit area"}
               </button>
               <button
-                className={mode === "seed" ? "active" : ""}
+                className={mode === "seed" ? "active" : impact ? "active" : ""}
                 onClick={() => setMode(mode === "seed" ? "view" : "seed")}
                 disabled={busy}
               >
-                ◎ Set impact
+                ◎ {impact ? "Edit impact" : "Set impact"}
+              </button>
+              <button
+                className={mode === "correct" ? "active" : anchors.length ? "active" : ""}
+                onClick={() => setMode(mode === "correct" ? "view" : "correct")}
+                disabled={busy || !impact}
+              >
+                ✎ {anchors.length ? `Add anchor (${anchors.length})` : "Add anchor"}
               </button>
               <button
                 className={mode === "land" ? "active" : landing ? "active" : ""}
                 onClick={() => setMode(mode === "land" ? "view" : "land")}
-                disabled={busy || points.length === 0}
+                disabled={busy || !impact}
               >
                 ⊕ {landing ? "Edit landing" : "Set landing"}
               </button>
               <button
                 className="primary"
                 onClick={runTrace}
-                disabled={busy || points.length === 0}
+                disabled={busy || !impact}
               >
                 ✦ Trace shot
-              </button>
-              <button
-                className={mode === "correct" ? "active" : ""}
-                onClick={() => setMode(mode === "correct" ? "view" : "correct")}
-                disabled={busy || !traceCtxRef.current}
-              >
-                ✎ {anchors.length > 1 ? `Anchors (${anchors.length})` : "Add anchor"}
               </button>
               <label className="field">
                 fps
@@ -458,9 +503,10 @@ export default function App() {
               </button>
               <button
                 onClick={() => {
+                  // Clear computed results but keep the user's anchors/impact/
+                  // landing so the shot can be re-traced.
                   setPoints([]);
                   setDebugFrames([]);
-                  setAnchors([]);
                   traceCtxRef.current = null;
                   setShareUrl("");
                   setStatus({ msg: "", kind: "" });
@@ -476,6 +522,7 @@ export default function App() {
                   setPoints([]);
                   setDebugFrames([]);
                   setAnchors([]);
+                  setImpact(null);
                   traceCtxRef.current = null;
                   setRoi(null);
                   setLanding(null);

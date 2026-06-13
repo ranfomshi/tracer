@@ -10,7 +10,9 @@ interface Props {
   mode: Mode;
   roi: Rect | null;
   landing: { x: number; y: number } | null;
-  /** Whether to draw editing guides (ROI box, landing marker); off in export. */
+  /** User-placed anchor positions (impact + mid-flight) to mark. */
+  markers: { x: number; y: number }[];
+  /** Whether to draw editing guides (markers, ROI box, landing); off in export. */
   showGuides: boolean;
   /** Whether to draw the raw detection candidates for the current frame. */
   debug: boolean;
@@ -29,6 +31,7 @@ export default function TracerStage({
   mode,
   roi,
   landing,
+  markers,
   showGuides,
   debug,
   debugFrames,
@@ -46,6 +49,8 @@ export default function TracerStage({
   roiRef.current = roi;
   const landingRef = useRef(landing);
   landingRef.current = landing;
+  const markersRef = useRef(markers);
+  markersRef.current = markers;
   const showGuidesRef = useRef(showGuides);
   showGuidesRef.current = showGuides;
   const debugRef = useRef(debug);
@@ -74,6 +79,7 @@ export default function TracerStage({
       if (showGuidesRef.current) {
         drawRoi(ctx, dragRectRef.current ?? roiRef.current, w, h);
         if (landingRef.current) drawLanding(ctx, landingRef.current);
+        for (const m of markersRef.current) drawMarker(ctx, m.x, m.y);
       }
       if (debugRef.current) {
         drawDebug(ctx, debugFramesRef.current, video.currentTime);
@@ -212,6 +218,18 @@ function drawDebug(
     ctx.lineWidth = 2;
     ctx.stroke();
   }
+  ctx.restore();
+}
+
+function drawMarker(ctx: CanvasRenderingContext2D, x: number, y: number) {
+  ctx.save();
+  ctx.fillStyle = "rgba(45, 212, 191, 0.9)";
+  ctx.strokeStyle = "rgba(7, 11, 16, 0.9)";
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.arc(x, y, 5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
   ctx.restore();
 }
 
