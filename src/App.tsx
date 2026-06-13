@@ -1,12 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import TracerStage from "./components/TracerStage";
-import { DEFAULT_OPTIONS, trackBall, type TrackPoint } from "./lib/tracker";
+import {
+  DEFAULT_OPTIONS,
+  trackBall,
+  type Rect,
+  type TrackPoint,
+} from "./lib/tracker";
 import { grabFrames } from "./lib/videoFrames";
 import { smoothPath } from "./lib/trajectory";
 import { recordCanvas, downloadBlob } from "./lib/export";
 import { saveTrace, getTrace } from "./lib/api";
 
-type Mode = "view" | "seed" | "correct";
+type Mode = "view" | "seed" | "correct" | "roi";
 type StatusKind = "" | "ok" | "error";
 
 const MAX_TRACK_SECONDS = 5;
@@ -16,9 +21,11 @@ export default function App() {
   const [meta, setMeta] = useState({ w: 0, h: 0, duration: 0 });
   const [fps, setFps] = useState(30);
   const [points, setPoints] = useState<TrackPoint[]>([]);
+  const [roi, setRoi] = useState<Rect | null>(null);
   const [mode, setMode] = useState<Mode>("view");
   const [clock, setClock] = useState(0);
   const [busy, setBusy] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const [status, setStatus] = useState<{ msg: string; kind: StatusKind }>({
     msg: "",
     kind: "",
@@ -72,9 +79,21 @@ export default function App() {
       return URL.createObjectURL(file);
     });
     setPoints([]);
+    setRoi(null);
     setShareUrl("");
     setMode("view");
     setStatus({ msg: "", kind: "" });
+  };
+
+  const handleRoiChange = (next: Rect | null) => {
+    setRoi(next);
+    setMode("view");
+    setStatus({
+      msg: next
+        ? "Detection area set — anything outside the box is ignored."
+        : "Detection area cleared.",
+      kind: "ok",
+    });
   };
 
   const seekTo = (t: number) => {
@@ -131,7 +150,12 @@ export default function App() {
         Math.ceil(MAX_TRACK_SECONDS * 120),
       );
       const frames = await grabFrames(v, scratch, seed.t, fps, count);
-      const tracked = trackBall(frames, { x: seed.x, y: seed.y }, DEFAULT_OPTIONS);
+      const tracked = trackBall(
+        frames,
+        { x: seed.x, y: seed.y },
+        DEFAULT_OPTIONS,
+        roi,
+      );
       setPoints(tracked);
       await seekToAsync(v, seed.t);
       const hit = tracked.filter((p) => p.confidence > 0.1).length;
@@ -154,6 +178,7 @@ export default function App() {
     const c = canvasRef.current;
     if (!v || !c || displayPoints.length < 2) return;
     setBusy(true);
+    setExporting(true);
     setStatus({ msg: "Rendering export…", kind: "" });
     try {
       const start = displayPoints[0].t;
@@ -167,6 +192,7 @@ export default function App() {
     } catch (err) {
       setStatus({ msg: `Export failed: ${(err as Error).message}`, kind: "error" });
     } finally {
+      setExporting(false);
       setBusy(false);
     }
   };
@@ -198,7 +224,9 @@ export default function App() {
       ? "Click the <b>ball</b> on this frame to set its starting point."
       : mode === "correct"
         ? "Click where the ball actually is to <b>fix</b> the nearest point."
-        : "";
+        : mode === "roi"
+          ? "Drag to box the <b>area the ball stays within</b>. Outside is ignored. Tiny box = clear."
+          : "";
 
   return (
     <div className="app">
@@ -249,9 +277,12 @@ export default function App() {
             videoUrl={videoUrl}
             points={displayPoints}
             mode={mode}
+            roi={roi}
+            overlayRoi={!exporting}
             videoRef={videoRef}
             canvasRef={canvasRef}
             onPoint={handlePoint}
+            onRoiChange={handleRoiChange}
             onLoadedMeta={(w, h, duration) => setMeta({ w, h, duration })}
             hint={hint}
           />
@@ -278,6 +309,13 @@ export default function App() {
             </div>
 
             <div className="row">
+              <button
+                className={mode === "roi" ? "active" : roi ? "active" : ""}
+                onClick={() => setMode(mode === "roi" ? "view" : "roi")}
+                disabled={busy}
+              >
+                ▦ {roi ? "Edit area" : "Limit area"}
+              </button>
               <button
                 className={mode === "seed" ? "active" : ""}
                 onClick={() => setMode(mode === "seed" ? "view" : "seed")}
@@ -335,6 +373,7 @@ export default function App() {
                   if (videoUrl) URL.revokeObjectURL(videoUrl);
                   setVideoUrl("");
                   setPoints([]);
+                  setRoi(null);
                 }}
                 disabled={busy}
               >

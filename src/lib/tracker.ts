@@ -44,6 +44,14 @@ export const DEFAULT_OPTIONS: TrackOptions = {
   velocitySmoothing: 0.45,
 };
 
+/** A rectangular region in video pixel coordinates. */
+export interface Rect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
 /** A single grabbed frame: raw RGBA pixels plus dimensions. */
 export interface Frame {
   frame: number;
@@ -76,12 +84,23 @@ function detectInWindow(
   cy: number,
   radius: number,
   threshold: number,
+  roi?: Rect | null,
 ): Detection | null {
   const { width, height } = cur;
-  const x0 = Math.max(0, Math.floor(cx - radius));
-  const x1 = Math.min(width - 1, Math.ceil(cx + radius));
-  const y0 = Math.max(0, Math.floor(cy - radius));
-  const y1 = Math.min(height - 1, Math.ceil(cy + radius));
+  let x0 = Math.max(0, Math.floor(cx - radius));
+  let x1 = Math.min(width - 1, Math.ceil(cx + radius));
+  let y0 = Math.max(0, Math.floor(cy - radius));
+  let y1 = Math.min(height - 1, Math.ceil(cy + radius));
+
+  // Clip the search window to the region of interest so anything outside the
+  // user-drawn box can never be picked up.
+  if (roi) {
+    x0 = Math.max(x0, Math.floor(roi.x));
+    y0 = Math.max(y0, Math.floor(roi.y));
+    x1 = Math.min(x1, Math.ceil(roi.x + roi.w) - 1);
+    y1 = Math.min(y1, Math.ceil(roi.y + roi.h) - 1);
+    if (x0 > x1 || y0 > y1) return null;
+  }
 
   let sumW = 0;
   let sumX = 0;
@@ -130,6 +149,7 @@ export function trackBall(
   frames: Frame[],
   seed: { x: number; y: number },
   opts: TrackOptions = DEFAULT_OPTIONS,
+  roi?: Rect | null,
 ): TrackPoint[] {
   if (frames.length === 0) return [];
 
@@ -170,6 +190,7 @@ export function trackBall(
       predY,
       radius,
       opts.motionThreshold,
+      roi,
     );
 
     let nx: number;
