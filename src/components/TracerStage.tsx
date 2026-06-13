@@ -78,7 +78,7 @@ export default function TracerStage({
       if (debugRef.current) {
         drawDebug(ctx, debugFramesRef.current, video.currentTime);
       }
-      drawTrail(ctx, pointsRef.current, video.currentTime);
+      drawTrail(ctx, pointsRef.current, video.currentTime, video.paused);
       raf = requestAnimationFrame(draw);
     };
     raf = requestAnimationFrame(draw);
@@ -239,6 +239,7 @@ function drawTrail(
   ctx: CanvasRenderingContext2D,
   points: TrackPoint[],
   time: number,
+  paused: boolean,
 ) {
   if (points.length < 2) {
     if (points.length === 1) drawHead(ctx, points[0].x, points[0].y);
@@ -247,7 +248,8 @@ function drawTrail(
 
   // Draw the trail directly through the tracked points, in time order, so it
   // always sits exactly on the detected ball path regardless of shot direction.
-  const progress = progressAtTime(points, time);
+  // When paused, show the whole arc; while playing it grows with the ball.
+  const progress = paused ? 1 : progressAtTime(points, time);
   const reveal = Math.max(1, Math.floor(progress * (points.length - 1)));
 
   ctx.save();
