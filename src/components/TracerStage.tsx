@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import type { TrackPoint } from "../lib/tracker";
-import { fitParabola, progressAtTime } from "../lib/trajectory";
+import { progressAtTime } from "../lib/trajectory";
 
 interface Props {
   videoUrl: string;
@@ -98,9 +98,10 @@ function drawTrail(
     return;
   }
 
-  const path = fitParabola(points);
+  // Draw the trail directly through the tracked points, in time order, so it
+  // always sits exactly on the detected ball path regardless of shot direction.
   const progress = progressAtTime(points, time);
-  const reveal = Math.max(1, Math.floor(progress * (path.length - 1)));
+  const reveal = Math.max(1, Math.floor(progress * (points.length - 1)));
 
   ctx.save();
   ctx.lineJoin = "round";
@@ -112,8 +113,8 @@ function drawTrail(
   ctx.strokeStyle = "rgba(230, 57, 70, 0.95)";
   ctx.lineWidth = 6;
   ctx.beginPath();
-  ctx.moveTo(path[0].x, path[0].y);
-  for (let i = 1; i <= reveal; i++) ctx.lineTo(path[i].x, path[i].y);
+  ctx.moveTo(points[0].x, points[0].y);
+  for (let i = 1; i <= reveal; i++) ctx.lineTo(points[i].x, points[i].y);
   ctx.stroke();
 
   // Bright inner core.
@@ -123,7 +124,7 @@ function drawTrail(
   ctx.stroke();
   ctx.restore();
 
-  const head = path[reveal];
+  const head = points[reveal];
   if (head) drawHead(ctx, head.x, head.y);
 }
 
