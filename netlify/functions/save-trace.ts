@@ -1,23 +1,25 @@
-import type { Handler } from "@netlify/functions";
 import { getStore } from "@netlify/blobs";
 
 // Persist a trace as JSON in a Netlify Blobs store and return a short id that
-// can be used to retrieve / share it.
+// can be used to retrieve / share it. Uses the Functions v2 signature so the
+// Blobs environment is wired up automatically.
 
 function randomId(): string {
-  return Math.random().toString(36).slice(2, 8) + Date.now().toString(36).slice(-4);
+  return (
+    Math.random().toString(36).slice(2, 8) + Date.now().toString(36).slice(-4)
+  );
 }
 
-export const handler: Handler = async (event) => {
-  if (event.httpMethod !== "POST") {
-    return { statusCode: 405, body: "Method Not Allowed" };
+export default async (req: Request): Promise<Response> => {
+  if (req.method !== "POST") {
+    return new Response("Method Not Allowed", { status: 405 });
   }
 
   let payload: unknown;
   try {
-    payload = JSON.parse(event.body || "{}");
+    payload = await req.json();
   } catch {
-    return { statusCode: 400, body: "Invalid JSON" };
+    return new Response("Invalid JSON", { status: 400 });
   }
 
   const trace = payload as {
@@ -25,9 +27,10 @@ export const handler: Handler = async (event) => {
     width?: number;
     height?: number;
     fps?: number;
+    note?: string;
   };
   if (!Array.isArray(trace.points) || trace.points.length === 0) {
-    return { statusCode: 400, body: "Trace must include points" };
+    return new Response("Trace must include points", { status: 400 });
   }
 
   const id = randomId();
@@ -38,15 +41,14 @@ export const handler: Handler = async (event) => {
     height: trace.height ?? 0,
     fps: trace.fps ?? 30,
     points: trace.points,
-    note: (payload as { note?: string }).note,
+    note: trace.note,
   };
 
   const store = getStore("traces");
   await store.setJSON(id, record);
 
-  return {
-    statusCode: 200,
+  return new Response(JSON.stringify({ id }), {
+    status: 200,
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ id }),
-  };
+  });
 };
