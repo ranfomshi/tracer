@@ -101,7 +101,7 @@ export default function TracerStage({
   };
 
   const handleClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (mode !== "seed" && mode !== "correct") return;
+    if (mode !== "seed" && mode !== "correct" && mode !== "land") return;
     const p = toNative(e);
     onPoint(p.x, p.y);
   };
