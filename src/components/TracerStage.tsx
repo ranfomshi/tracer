@@ -17,6 +17,9 @@ interface Props {
   /** Whether to draw the raw detection candidates for the current frame. */
   debug: boolean;
   debugFrames: { t: number; cands: Candidate[] }[];
+  /** Per-frame camera offsets (scene-lock). The trail is stored scene-locked
+   *  and shifted by the current frame's offset so it sticks to the scene. */
+  offsets: { t: number; dx: number; dy: number }[];
   videoRef: React.RefObject<HTMLVideoElement>;
   canvasRef: React.RefObject<HTMLCanvasElement>;
   onPoint: (x: number, y: number) => void;
@@ -35,6 +38,7 @@ export default function TracerStage({
   showGuides,
   debug,
   debugFrames,
+  offsets,
   videoRef,
   canvasRef,
   onPoint,
@@ -57,6 +61,8 @@ export default function TracerStage({
   debugRef.current = debug;
   const debugFramesRef = useRef(debugFrames);
   debugFramesRef.current = debugFrames;
+  const offsetsRef = useRef(offsets);
+  offsetsRef.current = offsets;
 
   // Live ROI drag (not committed until mouse-up).
   const dragStartRef = useRef<{ x: number; y: number } | null>(null);
@@ -84,7 +90,8 @@ export default function TracerStage({
       if (debugRef.current) {
         drawDebug(ctx, debugFramesRef.current, video.currentTime);
       }
-      drawTrail(ctx, pointsRef.current, video.currentTime, video.paused);
+      const o = offsetAt(offsetsRef.current, video.currentTime);
+      drawTrail(ctx, pointsRef.current, video.currentTime, video.paused, o);
       raf = requestAnimationFrame(draw);
     };
     raf = requestAnimationFrame(draw);
@@ -253,20 +260,43 @@ function drawLanding(
   ctx.restore();
 }
 
+/** Interpolate the camera offset at a given playback time. */
+function offsetAt(
+  offsets: { t: number; dx: number; dy: number }[],
+  t: number,
+): { dx: number; dy: number } {
+  if (offsets.length === 0) return { dx: 0, dy: 0 };
+  if (t <= offsets[0].t) return offsets[0];
+  const last = offsets[offsets.length - 1];
+  if (t >= last.t) return last;
+  for (let i = 1; i < offsets.length; i++) {
+    if (t <= offsets[i].t) {
+      const a = offsets[i - 1];
+      const b = offsets[i];
+      const f = (t - a.t) / (b.t - a.t || 1);
+      return { dx: a.dx + (b.dx - a.dx) * f, dy: a.dy + (b.dy - a.dy) * f };
+    }
+  }
+  return last;
+}
+
 function drawTrail(
   ctx: CanvasRenderingContext2D,
   points: TrackPoint[],
   time: number,
   paused: boolean,
+  o: { dx: number; dy: number },
 ) {
   if (points.length < 2) {
-    if (points.length === 1) drawHead(ctx, points[0].x, points[0].y);
+    if (points.length === 1) drawHead(ctx, points[0].x + o.dx, points[0].y + o.dy);
     return;
   }
 
-  // Draw the trail directly through the tracked points, in time order, so it
-  // always sits exactly on the detected ball path regardless of shot direction.
-  // When paused, show the whole arc; while playing it grows with the ball.
+  // Draw the trail through the tracked points (in time order) so it sits on the
+  // detected path regardless of shot direction. Points are stored scene-locked,
+  // so we add the current frame's camera offset to keep the arc glued to the
+  // background as the camera pans. When paused, show the whole arc; while
+  // playing it grows with the ball.
   const progress = paused ? 1 : progressAtTime(points, time);
   const reveal = Math.max(1, Math.floor(progress * (points.length - 1)));
 
@@ -279,8 +309,8 @@ function drawTrail(
   ctx.strokeStyle = "rgba(230, 57, 70, 0.95)";
   ctx.lineWidth = 6;
   ctx.beginPath();
-  ctx.moveTo(points[0].x, points[0].y);
-  for (let i = 1; i <= reveal; i++) ctx.lineTo(points[i].x, points[i].y);
+  ctx.moveTo(points[0].x + o.dx, points[0].y + o.dy);
+  for (let i = 1; i <= reveal; i++) ctx.lineTo(points[i].x + o.dx, points[i].y + o.dy);
   ctx.stroke();
 
   ctx.shadowBlur = 0;
@@ -290,7 +320,7 @@ function drawTrail(
   ctx.restore();
 
   const head = points[reveal];
-  if (head) drawHead(ctx, head.x, head.y);
+  if (head) drawHead(ctx, head.x + o.dx, head.y + o.dy);
 }
 
 function drawHead(ctx: CanvasRenderingContext2D, x: number, y: number) {

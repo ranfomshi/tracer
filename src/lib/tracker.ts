@@ -296,10 +296,11 @@ export function fitTrajectory(
   const anchorByN = new Map<number, Anchor>();
   for (const a of anchors) anchorByN.set(a.n, a);
 
-  // Constant-acceleration projectile model in BOTH axes:
-  //   x(n) = ax·n² + bx·n + cx   (drag bleeds off horizontal speed)
-  //   y(n) = ay·n² + by·n + cy   (gravity)
-  let ax = 0;
+  // Projectile model: constant horizontal velocity, gravity on the vertical —
+  //   x(n) = bx·n + cx           (linear: steady horizontal speed)
+  //   y(n) = ay·n² + by·n + cy   (quadratic: rises, hangs, falls — gravity)
+  // Keeping x linear is what makes the path arc UP-and-over instead of bowing
+  // sideways: detection noise can't inject spurious horizontal curvature.
   let bx = 0;
   let cx = anchors[0]?.x ?? 0;
   let ay = 0;
@@ -322,7 +323,7 @@ export function fitTrajectory(
       if (iter === 0) {
         pick = cands[0]; // strongest blob — bootstrap the whole arc
       } else {
-        const predX = ax * n * n + bx * n + cx;
+        const predX = bx * n + cx;
         const predY = ay * n * n + by * n + cy;
         let bestD = gate;
         for (const c of cands) {
@@ -338,10 +339,9 @@ export function fitTrajectory(
         sy.push({ t: n, v: pick.y, w: pick.score });
       }
     }
-    const qx = fitQuad(sx);
-    ax = qx.a;
-    bx = qx.b;
-    cx = qx.c;
+    const lx = fitLinear(sx);
+    bx = lx.m;
+    cx = lx.b;
     const qy = fitQuad(sy);
     ay = qy.a;
     by = qy.b;
@@ -351,7 +351,7 @@ export function fitTrajectory(
   const points: TrackPoint[] = [];
   for (let n = 0; n < N; n++) {
     const anchor = anchorByN.get(n);
-    const x = anchor ? anchor.x : ax * n * n + bx * n + cx;
+    const x = anchor ? anchor.x : bx * n + cx;
     const y = anchor ? anchor.y : ay * n * n + by * n + cy;
     let support = anchor ? 1 : 0;
     if (!anchor) {

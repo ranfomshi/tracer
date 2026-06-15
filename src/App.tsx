@@ -29,8 +29,10 @@ interface TraceCtx {
   diag: number;
   seedT: number;
   dt: number;
+  offsets: Offset[];
 }
 import { grabFrames } from "./lib/videoFrames";
+import { estimateOffsets, type Offset } from "./lib/stabilize";
 import { smoothPath } from "./lib/trajectory";
 import { recordCanvas, downloadBlob } from "./lib/export";
 import { saveTrace, getTrace } from "./lib/api";
@@ -57,6 +59,12 @@ export default function App() {
   const [debug, setDebug] = useState(false);
   const [debugFrames, setDebugFrames] = useState<DebugFrame[]>([]);
   const [anchors, setAnchors] = useState<TAnchor[]>([]);
+  const [stabilize, setStabilize] = useState(true);
+  // Per-frame camera offsets as a time-indexed table for the overlay, so the
+  // drawn (scene-locked) arc can be re-projected into each frame as it plays.
+  const [sceneOffsets, setSceneOffsets] = useState<
+    { t: number; dx: number; dy: number }[]
+  >([]);
   const [status, setStatus] = useState<{ msg: string; kind: StatusKind }>({
     msg: "",
     kind: "",
@@ -96,19 +104,41 @@ export default function App() {
     return [...byN.values()].sort((a, b) => a.n - b.n);
   };
 
+  // Cancel out camera motion: bring raw image positions into scene-locked
+  // (frame-0) coordinates by subtracting that frame's cumulative offset.
+  const stabilizeAnchorList = (anchored: Anchor[], offsets: Offset[]): Anchor[] =>
+    anchored.map((a) => {
+      const o = offsets[a.n] ?? { dx: 0, dy: 0 };
+      return { n: a.n, x: a.x - o.dx, y: a.y - o.dy };
+    });
+
+  const stabilizeCandidates = (
+    cands: Candidate[][],
+    offsets: Offset[],
+  ): Candidate[][] =>
+    cands.map((frame, n) => {
+      const o = offsets[n] ?? { dx: 0, dy: 0 };
+      return frame.map((c) => ({ x: c.x - o.dx, y: c.y - o.dy, score: c.score }));
+    });
+
   // Drop a computed trace (keeps the user's anchors) — used when the window-
   // defining impact/landing changes and a fresh trace is needed.
   const invalidateTrace = () => {
     setPoints([]);
     setDebugFrames([]);
+    setSceneOffsets([]);
     traceCtxRef.current = null;
   };
 
   // Re-fit from cached detections (used when anchors change after a trace).
+  // Cached candidates are already scene-locked, so stabilize the anchors too.
   const refitFromCtx = (list: TAnchor[]) => {
     const ctx = traceCtxRef.current;
     if (!ctx) return;
-    const anchored = anchorsByFrame(list, ctx.seedT, ctx.dt, ctx.frameMeta.length);
+    const anchored = stabilizeAnchorList(
+      anchorsByFrame(list, ctx.seedT, ctx.dt, ctx.frameMeta.length),
+      ctx.offsets,
+    );
     setPoints(fitTrajectory(ctx.candidates, ctx.frameMeta, anchored, ctx.diag));
   };
 
@@ -153,6 +183,7 @@ export default function App() {
     });
     setPoints([]);
     setDebugFrames([]);
+    setSceneOffsets([]);
     setAnchors([]);
     setImpact(null);
     traceCtxRef.current = null;
@@ -258,12 +289,26 @@ export default function App() {
       // Even time spacing across the window (subsamples long / slow-mo clips).
       const dt = count > 1 ? fullSpan / (count - 1) : 1 / fps;
       const frames = await grabFrames(v, scratch, seed.t, dt, count);
-      const candidates = detectCandidates(frames, { x: seed.x, y: seed.y }, DEFAULT_OPTIONS, roi);
+      // Estimate camera motion so detections/anchors can be fitted in a
+      // scene-locked frame (no compensation when the toggle is off).
+      const offsets: Offset[] = stabilize
+        ? estimateOffsets(frames, roi)
+        : frames.map(() => ({ dx: 0, dy: 0 }));
+      const rawCandidates = detectCandidates(
+        frames,
+        { x: seed.x, y: seed.y },
+        DEFAULT_OPTIONS,
+        roi,
+      );
+      const candidates = stabilizeCandidates(rawCandidates, offsets);
       const frameMeta = frames.map((f) => ({ frame: f.frame, t: f.t }));
       const diag = Math.hypot(meta.w, meta.h);
       // Map every user anchor (impact + mid-flight + landing) onto frame indices
-      // and fit through them; detection fills the gaps.
-      const anchored = anchorsByFrame(allAnchors, seed.t, dt, frames.length);
+      // (scene-locked) and fit through them; detection fills the gaps.
+      const anchored = stabilizeAnchorList(
+        anchorsByFrame(allAnchors, seed.t, dt, frames.length),
+        offsets,
+      );
       const tracked = fitTrajectory(candidates, frameMeta, anchored, diag);
 
       // Cache the detection context so anchor edits re-fit instantly (no re-grab).
@@ -273,10 +318,18 @@ export default function App() {
         diag,
         seedT: seed.t,
         dt,
+        offsets,
       };
       setPoints(tracked);
+      setSceneOffsets(
+        frameMeta.map((m, n) => ({
+          t: m.t,
+          dx: offsets[n]?.dx ?? 0,
+          dy: offsets[n]?.dy ?? 0,
+        })),
+      );
       setDebugFrames(
-        tracked.map((p, n) => ({ t: p.t, cands: candidates[n] ?? [] })),
+        tracked.map((p, n) => ({ t: p.t, cands: rawCandidates[n] ?? [] })),
       );
       await seekToAsync(v, seed.t);
       const hit = tracked.filter((p) => p.confidence > 0.1).length;
@@ -414,6 +467,7 @@ export default function App() {
             showGuides={!exporting}
             debug={debug && !exporting}
             debugFrames={debugFrames}
+            offsets={sceneOffsets}
             videoRef={videoRef}
             canvasRef={canvasRef}
             onPoint={handlePoint}
@@ -479,6 +533,14 @@ export default function App() {
                 ⊕ {landing ? "Edit landing" : "Set landing"}
               </button>
               <button
+                className={stabilize ? "active" : ""}
+                onClick={() => setStabilize((s) => !s)}
+                disabled={busy}
+                title="Cancel camera pan/tilt so the arc stays locked to the scene"
+              >
+                🎥 Stabilize {stabilize ? "on" : "off"}
+              </button>
+              <button
                 className="primary"
                 onClick={runTrace}
                 disabled={busy || !impact}
@@ -519,6 +581,7 @@ export default function App() {
                   // landing so the shot can be re-traced.
                   setPoints([]);
                   setDebugFrames([]);
+                  setSceneOffsets([]);
                   traceCtxRef.current = null;
                   setShareUrl("");
                   setStatus({ msg: "", kind: "" });
@@ -533,6 +596,7 @@ export default function App() {
                   setVideoUrl("");
                   setPoints([]);
                   setDebugFrames([]);
+                  setSceneOffsets([]);
                   setAnchors([]);
                   setImpact(null);
                   traceCtxRef.current = null;
